@@ -97,7 +97,7 @@ pub(super) fn paint_drag_label(ctx: &Context, engines: &[Installation], theme: &
         rect,
         5.,
         color(theme.card),
-        Stroke::new(2., color(theme.accent_hover)),
+        Stroke::new(2_f32, color(theme.accent_hover)),
         StrokeKind::Inside,
     );
     painter.galley(rect.min + vec2(12., 10.), text, color(theme.text));

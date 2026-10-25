@@ -110,7 +110,7 @@ impl Widget for AppCheckbox<'_> {
                 indicator,
                 CornerRadius::same(CHECKBOX_RADIUS),
                 fill,
-                Stroke::new(1., border),
+                Stroke::new(1_f32, border),
                 StrokeKind::Inside,
             );
             if *self.checked {
@@ -120,14 +120,14 @@ impl Widget for AppCheckbox<'_> {
                         indicator.min + vec2(8., 13.),
                         indicator.min + vec2(14., 5.),
                     ],
-                    Stroke::new(2., color(self.theme.on_accent)),
+                    Stroke::new(2_f32, color(self.theme.on_accent)),
                 ));
             }
             if response.has_focus() {
                 ui.painter().rect_stroke(
                     indicator.expand(2.),
                     CornerRadius::same(CHECKBOX_RADIUS + 1),
-                    Stroke::new(1., color(self.theme.accent)),
+                    Stroke::new(1_f32, color(self.theme.accent)),
                     StrokeKind::Outside,
                 );
             }
@@ -277,7 +277,7 @@ pub(super) fn link_card(
     ui.painter().rect_stroke(
         rect,
         6.,
-        Stroke::new(1., color(theme.border)),
+        Stroke::new(1_f32, color(theme.border)),
         StrokeKind::Inside,
     );
     let text = ui

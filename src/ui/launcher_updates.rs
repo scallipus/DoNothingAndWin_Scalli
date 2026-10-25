@@ -95,6 +95,10 @@ impl Workspace {
     }
 
     fn start_launcher_update_check(&mut self, ctx: &Context) {
+        // Do not offer official upstream installers as updates to this unofficial edition.
+        if env!("CARGO_PKG_VERSION").contains("-community.") {
+            return;
+        }
         if self.launcher_updates.receiver.is_some() {
             return;
         }
@@ -153,6 +157,10 @@ impl Workspace {
 
     pub(super) fn launcher_update_settings(&mut self, ui: &mut Ui, ctx: &Context) {
         ui.heading("Launcher updates");
+        if env!("CARGO_PKG_VERSION").contains("-community.") {
+            ui.label("Unofficial community edition: automatic updates from the original author are disabled to prevent replacing this build. Check the upstream repository manually for releases.");
+            return;
+        }
         ui.label(concat!(
             "DoNothing&Win Launcher ",
             env!("CARGO_PKG_VERSION")

@@ -272,7 +272,7 @@ impl Workspace {
             ui.painter().circle_stroke(
                 c.point(badge_x, action_y + 16.),
                 8. * c.scale(),
-                Stroke::new(1.5, color(link_color)),
+                Stroke::new(1.5_f32, color(link_color)),
             );
             c.text(
                 ui,
@@ -434,6 +434,27 @@ impl Workspace {
         }
     }
     pub(super) fn library_page(&mut self, ui: &mut Ui, c: &Canvas) {
+        self.asset_tags.popup(ui.ctx());
+        if self
+            .zip_assets
+            .toolbar(ui, c, &self.prefs.custom_asset_caches)
+        {
+            let known_projects: Vec<(String, String)> = self
+                .projects
+                .iter()
+                .map(|p| (p.name.clone(), p.path.clone()))
+                .collect();
+            self.zip_assets.page(
+                ui,
+                c,
+                &self.prefs.custom_asset_caches,
+                &self.prefs.local_install_staging_root,
+                &mut self.asset_tags,
+                self.prefs.library_thumbnail_size,
+                &known_projects,
+            );
+            return;
+        }
         if !self.demo {
             self.real_library_page(ui, c);
             return;

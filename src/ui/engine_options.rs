@@ -119,7 +119,7 @@ fn option_row(
         ui.painter().rect_stroke(
             box_rect,
             3.,
-            Stroke::new(1., color(theme.muted)),
+            Stroke::new(1_f32, color(theme.muted)),
             StrokeKind::Inside,
         );
     }
@@ -127,7 +127,7 @@ fn option_row(
         ui.painter().line_segment(
             [box_rect.min + vec2(5., 11.), box_rect.min + vec2(9., 15.)],
             Stroke::new(
-                2.,
+                2_f32,
                 color(if enabled {
                     theme.on_accent
                 } else {
@@ -138,7 +138,7 @@ fn option_row(
         ui.painter().line_segment(
             [box_rect.min + vec2(9., 15.), box_rect.min + vec2(18., 6.)],
             Stroke::new(
-                2.,
+                2_f32,
                 color(if enabled {
                     theme.on_accent
                 } else {
@@ -181,7 +181,7 @@ fn component_panel(ui: &mut Ui, theme: &Theme, options: &mut Options, platform: 
     let mut changed = false;
     Frame::new()
         .fill(color(theme.card))
-        .stroke(Stroke::new(1., color(theme.border)))
+        .stroke(Stroke::new(1_f32, color(theme.border)))
         .corner_radius(6.)
         .inner_margin(16)
         .show(ui, |ui| {

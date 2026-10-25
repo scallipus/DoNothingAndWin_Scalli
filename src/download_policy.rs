@@ -63,7 +63,7 @@ pub fn with_cache_root<T>(root: Option<PathBuf>, work: impl FnOnce() -> T) -> T 
 fn cache_path(chunk: &Chunk) -> PathBuf {
     CACHE_ROOT
         .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(|| PathBuf::from(storage::load_preferences().fab_cache))
+        .unwrap_or_else(|| PathBuf::from(storage::load_preferences().chunk_cache_root().to_owned()))
         .join("EngineWorkspace/Chunks")
         .join(buildpatch::hex(&chunk.sha))
 }
@@ -74,7 +74,7 @@ pub(crate) fn cached_chunk_progress(chunk: &Chunk, read: &mut impl FnMut(u64)) -
     let prefs = storage::load_preferences();
     let root = CACHE_ROOT
         .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(|| PathBuf::from(&prefs.fab_cache));
+        .unwrap_or_else(|| PathBuf::from(prefs.chunk_cache_root()));
     let primary = root
         .join("EngineWorkspace/Chunks")
         .join(buildpatch::hex(&chunk.sha));

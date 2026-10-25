@@ -162,13 +162,7 @@ impl Workspace {
             };
             fab::plugin_download::cache_directory(&root)
         };
-        let cache_root = if d.custom {
-            Some(PathBuf::from(&self.prefs.fab_cache))
-        } else {
-            self.prefs
-                .vault_download_root(&d.cache_root)
-                .map(PathBuf::from)
-        };
+        let cache_root = Some(PathBuf::from(self.prefs.chunk_cache_root()));
         d.active = true;
         d.completed = None;
         d.progress = Default::default();
@@ -209,7 +203,7 @@ impl Workspace {
         self.library.download.cache_root = if self.prefs.ask_vault_cache {
             String::new()
         } else {
-            self.prefs.fab_cache.clone()
+            self.prefs.default_vault_cache.clone()
         };
     }
 

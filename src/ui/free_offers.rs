@@ -236,7 +236,7 @@ impl Workspace {
             ui.allocate_ui_with_layout(vec2(width, 0.), Layout::top_down(Align::Min), |ui| {
                 Frame::new()
                     .fill(color(theme.card))
-                    .stroke(Stroke::new(1., color(theme.border)))
+                    .stroke(Stroke::new(1_f32, color(theme.border)))
                     .corner_radius(6.)
                     .show(ui, |ui| {
                         ui.set_width(width - 2.);

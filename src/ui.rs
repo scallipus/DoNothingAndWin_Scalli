@@ -1,8 +1,12 @@
+mod activity_ticker;
+mod asset_badges;
+mod asset_tags;
 mod buttons;
 mod cache_health;
 mod categories;
 mod clone_project;
 mod community;
+mod custom_zip_view;
 mod dialog;
 mod downloads;
 mod engine_options;
@@ -13,6 +17,9 @@ mod layout_probe;
 mod library;
 mod library_folders;
 mod library_queue;
+mod library_card;
+mod library_asset_menu;
+mod library_view_toolbar;
 mod loading;
 mod navigation;
 mod plugin_activity;
@@ -26,6 +33,7 @@ mod project_visibility;
 mod scrollbar;
 mod settings_flow;
 mod transfers;
+mod validation_session;
 mod vault_cache;
 mod workspace_cache;
 use buttons::primary_button;
@@ -148,16 +156,23 @@ pub struct Workspace {
     new_engine: usize,
     selected: Option<usize>,
     toast: Option<Toast>,
-    free: Option<u64>,
     project_scroll: f32,
     layout_probe: Option<layout_probe::LayoutProbe>,
     transfer: transfers::Transfers,
     scan: transfers::Scan,
     project_finder: project_finder::Finder,
     engine_space: settings_flow::EngineSpace,
+
+    fab_cache_space: settings_flow::CacheSpace,
+    vault_cache_space: settings_flow::CacheSpace,
+    vault_discovery: settings_flow::VaultDiscovery,
+
     plugin_engine: Option<usize>,
     plugin_work: plugin_jobs::PluginWork,
     library: library::Library,
+    zip_assets: custom_zip_view::ZipAssets,
+    asset_tags: asset_tags::Registry,
+    library_activity_open: bool,
     free_offers: free_offers::FreeOffers,
     vault: vault_cache::Vault,
     cache_health: cache_health::State,
@@ -258,7 +273,7 @@ fn search_field(
         rect,
         BUTTON_RADIUS,
         Stroke::new(
-            1.,
+            1_f32,
             color(if response.has_focus() {
                 theme.accent
             } else {
@@ -313,7 +328,7 @@ fn search_field(
 fn highlighted_panel(theme: &Theme) -> Frame {
     Frame::new()
         .fill(color(theme.card))
-        .stroke(Stroke::new(1.5, color(theme.accent)))
+        .stroke(Stroke::new(1.5_f32, color(theme.accent)))
         .corner_radius(6.)
         .inner_margin(22)
 }
@@ -608,6 +623,9 @@ impl Workspace {
             cloning: Default::default(),
             backup: Default::default(),
             free_offers: Default::default(),
+            zip_assets: Default::default(),
+            asset_tags: asset_tags::Registry::load(),
+            library_activity_open: false,
             vault: Default::default(),
             cache_health: cache_health::State::load(),
             new_project: false,
@@ -616,16 +634,20 @@ impl Workspace {
             new_engine: 0,
             selected: None,
             toast: None,
-            free: platform::free_space(),
             project_scroll: 0.0,
             layout_probe: layout_probe::LayoutProbe::from_args(),
             transfer: transfers::Transfers::default(),
             scan: transfers::Scan::default(),
             project_finder: Default::default(),
             engine_space: settings_flow::EngineSpace::default(),
+
+            fab_cache_space: Default::default(),
+            vault_cache_space: Default::default(),
+            vault_discovery: settings_flow::VaultDiscovery::default(),
+
             plugin_engine: None,
             plugin_work: Default::default(),
-            library: Default::default(),
+            library: library::Library::restore_vault_queue(),
             downloads: downloads::Downloads::load(),
             plugin_search: String::new(),
             plugin_updates_only: false,
@@ -1109,7 +1131,7 @@ impl Workspace {
                 ui.painter().circle_stroke(
                     center,
                     8. * c.scale(),
-                    Stroke::new(1.5, color(badge_color)),
+                    Stroke::new(1.5_f32, color(badge_color)),
                 );
                 c.text(
                     ui,
@@ -1379,7 +1401,7 @@ impl Workspace {
                 ui.painter().circle_stroke(
                     c.point(x, y),
                     8. * c.scale(),
-                    Stroke::new(1.5, color(self.theme.warning)),
+                    Stroke::new(1.5_f32, color(self.theme.warning)),
                 );
                 c.text(
                     ui,
@@ -1455,114 +1477,146 @@ impl Workspace {
         } else {
             self.theme.subtle
         };
-        let storage = if self.demo {
-            "Storage 248 GB available".into()
+        // Each configured destination has its own volume. Do not substitute the
+        // process/system drive if a configured location is missing or offline.
+        let engine_storage = if self.demo {
+            "Engine Storage 248 GiB available".to_owned()
         } else {
-            self.free
-                .map(|n| format!("Storage {} GB available", n / 1_073_741_824))
-                .unwrap_or_else(|| "Storage unavailable".into())
+            let root = Path::new(&self.prefs.install_root);
+            if root.as_os_str().is_empty() {
+                "Engine Storage unavailable".to_owned()
+            } else {
+                let existing = root.ancestors().find(|p| p.exists()).unwrap_or(root);
+                fs2::available_space(existing)
+                    .map(|n| format!("Engine Storage {} GiB available", n / 1_073_741_824))
+                    .unwrap_or_else(|_| "Engine Storage unavailable".to_owned())
+            }
         };
+        let vault_storage = if self.demo {
+            "Vault Storage unavailable (demo)".to_owned()
+        } else {
+            let root = Path::new(&self.prefs.default_vault_cache);
+            if root.as_os_str().is_empty() {
+                "Vault Storage unavailable (not configured)".to_owned()
+            } else {
+                fs2::available_space(root)
+                    .map(|n| format!("Vault Storage {} GiB available", n / 1_073_741_824))
+                    .unwrap_or_else(|_| "Vault Storage unavailable".to_owned())
+            }
+        };
+        let storage = format!("{engine_storage} | {vault_storage}");
         let storage = if self.page == Page::Library && !self.library.footer.is_empty() {
             format!("{} | {storage}", self.library.footer)
         } else {
             storage
         };
-        let activity = if self.backup.busy() {
-            Some((
-                "Project backup".into(),
+        // Collect all active activities, independently of the currently selected page.
+        // Updating the ticker must never start, stop, or reorder background jobs.
+        let mut activities = activity_ticker::Registry::default();
+        if self.backup.busy() {
+            activities.register(
+                "project-backup",
+                "Project backup",
                 self.backup.status(),
                 self.backup.fraction(),
-            ))
-        } else if self.transfer.busy() {
+            );
+        }
+        if self.transfer.busy() {
             let p = self.transfer.operation.progress();
-            Some((
-                self.transfer.state.clone(),
-                p.phase,
-                if p.total > 0 {
-                    Some((p.completed as f32 / p.total as f32).clamp(0., 1.))
-                } else {
-                    None
-                },
-            ))
-        } else if let Some(status) = self.library_transfer_status() {
-            Some(("Library transfer".into(), status.into(), None))
-        } else if self.plugin_work.mutating {
-            Some((
-                self.plugin_work
-                    .snapshot()
-                    .map(|p| p.title)
-                    .unwrap_or_else(|| "Plugin operation".into()),
-                self.plugin_work.status.clone(),
+            activities.register(
+                "transfer",
+                &self.transfer.state,
+                &p.phase,
+                (p.total > 0).then_some((p.completed as f32 / p.total.max(1) as f32).clamp(0., 1.)),
+            );
+        }
+        if let Some(status) = self.library_transfer_status() {
+            activities.register("fab-transfer", "Fab Library transfer", status, None);
+        }
+        if self.plugin_work.mutating {
+            activities.register(
+                "plugins",
+                "Plugin operation",
+                &self.plugin_work.status,
                 self.plugin_work.fraction(),
-            ))
-        } else {
-            None
-        };
-        let cache_status_visible =
-            self.cache_health.busy() || (activity.is_none() && self.cache_verification_visible());
-        if cache_status_visible {
-            self.cache_verification_footer(ui, &c);
-        } else if let Some((title, detail, progress)) = activity {
-            let rect = c.rect([271., c.height - 47., (c.width - 540.).max(220.), 42.]);
-            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                ui.set_width(rect.width());
+            );
+        }
+        if self.cache_health.busy() {
+            activities.register(
+                "fab-verification",
+                self.cache_health.heading(),
+                self.cache_health.detail(),
+                self.cache_health.ticker_progress(),
+            );
+        }
+        if self.zip_assets.has_active_activity() {
+            activities.register(
+                "zip",
+                "ZIP Library",
+                self.zip_assets.activity_description(),
+                None,
+            );
+        }
+        if !self.library_footer_status().is_empty() {
+            activities.register(
+                "fab-background",
+                "Fab Library",
+                self.library_footer_status(),
+                None,
+            );
+        }
+        let ticker_rect = c.rect([271., c.height - 47., (c.width - 540.).max(220.), 42.]);
+        let ticker_time = ctx.input(|i| i.time);
+        if let Some(item) = activities.current(ticker_time) {
+            ui.scope_builder(UiBuilder::new().max_rect(ticker_rect), |ui| {
+                ui.set_width(ticker_rect.width());
                 ui.spacing_mut().item_spacing.y = 3.;
-                let text = match progress {
-                    Some(p) => format!("{title} - {detail} · {:.0}%", p * 100.),
-                    None => format!("{title} - {detail}"),
-                };
+                let label = format!(
+                    "{}: {}{}",
+                    item.title,
+                    item.detail,
+                    item.progress
+                        .map(|p| format!(" · {:.0}%", p * 100.))
+                        .unwrap_or_default()
+                );
                 ui.add(
                     Label::new(
-                        RichText::new(text)
+                        RichText::new(label)
                             .size(13. * c.scale())
                             .color(color(self.theme.text)),
                     )
                     .truncate(),
                 )
-                .on_hover_text(&detail);
-                if let Some(value) = progress {
+                .on_hover_text(format!("{}: {}", item.title, item.detail));
+                if let Some(progress) = item.progress {
                     ui.add(
-                        ProgressBar::new(value)
-                            .desired_width(rect.width())
+                        ProgressBar::new(progress)
+                            .desired_width(ticker_rect.width())
                             .desired_height(5.),
-                    );
-                } else {
-                    indeterminate_progress(
-                        ui,
-                        rect.width(),
-                        5.,
-                        self.theme.accent,
-                        self.theme.border,
                     );
                 }
             });
             if ui
-                .interact(rect, Id::new("footer-transfer-progress"), Sense::click())
-                .on_hover_text(if self.backup.busy() {
-                    "View project backup"
-                } else {
-                    "Open Downloads"
-                })
-                .clone()
+                .interact(
+                    ticker_rect,
+                    Id::new("global-activity-ticker"),
+                    Sense::click(),
+                )
+                .on_hover_text("Show all background activities")
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .clicked()
             {
-                if self.backup.busy() {
-                    self.backup.open = true;
-                } else {
-                    self.page = Page::Downloads;
-                    self.plugin_engine = None;
-                }
+                self.library_activity_open = true;
             }
-            ctx.request_repaint_after(Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             if self.page != Page::Library {
                 c.circle(ui, 280., c.height - 26., 6., status_color);
             }
-            let status = if self.page == Page::Downloads {
-                "No active downloads".into()
+            let idle = if self.page == Page::Downloads {
+                "No active downloads".to_owned()
             } else if self.page == Page::Library {
-                self.library_footer_status().to_owned()
+                "No active background activity".to_owned()
             } else if self.page == Page::Engines {
                 if let Some(error) = &self.error {
                     error.clone()
@@ -1575,95 +1629,63 @@ impl Workspace {
                         self.snapshot.releases.len()
                     )
                 } else {
-                    "Sign in with Epic to verify hotfixes and account-visible builds.".into()
+                    "Sign in with Epic to verify hotfixes and account-visible builds.".to_owned()
                 }
             } else {
                 self.status.clone()
             };
-            if self.page == Page::Library {
-                if !status.is_empty() {
-                    ui.put(
-                        c.rect([271., c.height - 37., 22., 22.]),
-                        loading::spinner(&self.theme),
-                    );
-                    let storage_width = ui
-                        .painter()
-                        .layout_no_wrap(
-                            storage.clone(),
-                            FontId::proportional(14. * c.scale()),
-                            color(self.theme.muted),
-                        )
-                        .size()
-                        .x;
-                    let left = c.point(305., c.height - 40.);
-                    let right = c.point(c.width - 31., c.height - 12.);
-                    let rect = Rect::from_min_max(
-                        left,
-                        pos2((right.x - storage_width - 24.).max(left.x + 1.), right.y),
-                    );
-                    ui.scope_builder(
-                        UiBuilder::new()
-                            .max_rect(rect)
-                            .layout(Layout::left_to_right(Align::Center)),
-                        |ui| {
-                            ui.add(
-                                Label::new(
-                                    RichText::new(&status)
-                                        .size(14. * c.scale())
-                                        .color(color(self.theme.text)),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&status);
-                        },
-                    );
-                }
-            } else {
-                let storage_width = ui
-                    .painter()
-                    .layout_no_wrap(
-                        storage.clone(),
-                        FontId::proportional(14. * c.scale()),
-                        color(self.theme.muted),
-                    )
-                    .size()
-                    .x;
-                let left = c.point(297., c.height - 40.);
-                let right = c.point(c.width - 31., c.height - 12.);
-                let rect = Rect::from_min_max(
-                    left,
-                    pos2((right.x - storage_width - 24.).max(left.x + 1.), right.y),
-                );
-                ui.scope_builder(
-                    UiBuilder::new()
-                        .max_rect(rect)
-                        .layout(Layout::left_to_right(Align::Center)),
-                    |ui| {
-                        ui.add(
-                            Label::new(
-                                RichText::new(&status)
-                                    .size(14. * c.scale())
-                                    .color(color(self.theme.muted)),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(&status);
-                    },
-                );
-            }
-        }
-        if !cache_status_visible {
-            c.text(
-                ui,
-                c.width - 31.,
-                c.height - 26.,
-                &storage,
-                14.,
-                false,
-                self.theme.muted,
-                Align2::RIGHT_CENTER,
+            // Align the idle activity label with the storage summary's
+            // vertical centreline, while clipping long messages to the left.
+            let idle_x = if self.page == Page::Library { 280.0_f32 } else { 296.0_f32 };
+            let idle_clip = c.rect([
+                idle_x,
+                c.height - 38.0_f32,
+                (c.width - 540.0_f32).max(220.0_f32),
+                24.0_f32,
+            ]);
+            ui.painter().with_clip_rect(idle_clip).text(
+                c.point(idle_x, c.height - 26.0_f32),
+                Align2::LEFT_CENTER,
+                idle,
+                FontId::proportional(14.0_f32 * c.scale()),
+                color(self.theme.muted),
             );
         }
+        if self.library_activity_open {
+            let mut open = true;
+            egui::Window::new("Background activity details")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label(
+                        "Activities from all pages. Closing this window does not affect jobs.",
+                    );
+                    ui.separator();
+                    if activities.all().is_empty() {
+                        ui.label("No background operations currently reported.");
+                    }
+                    for item in activities.all() {
+                        ui.label(RichText::new(&item.title).strong());
+                        ui.label(&item.detail);
+                        if let Some(p) = item.progress {
+                            ui.add(ProgressBar::new(p).show_percentage());
+                        }
+                        ui.separator();
+                    }
+                });
+            self.library_activity_open = open;
+        }
+        c.text(
+            ui,
+            c.width - 31.,
+            c.height - 26.,
+            &storage,
+            14.,
+            false,
+            self.theme.muted,
+            Align2::RIGHT_CENTER,
+        );
         if let Some(toast) = &self.toast {
             if toast.created.elapsed() < Duration::from_secs(6) {
                 let width = ((c.width - 340.) * c.sx).min(1000.);
@@ -3182,7 +3204,7 @@ impl Canvas {
     }
     fn icon(&self, ui: &Ui, icon: Icon, x: f32, y: f32, size: f32, col: [u8; 3]) {
         let p = ui.painter();
-        let s = Stroke::new(1.7 * self.scale(), color(col));
+        let s = Stroke::new(1.7_f32 * self.scale(), color(col));
         let point = |a: f32, b: f32| self.point(x + a * size / 24., y + b * size / 24.);
         let line = |a: [f32; 2], b: [f32; 2]| {
             p.line_segment([point(a[0], a[1]), point(b[0], b[1])], s);

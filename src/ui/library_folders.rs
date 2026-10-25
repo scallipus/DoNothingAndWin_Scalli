@@ -10,6 +10,8 @@ pub(super) struct FolderView {
     renaming: Option<String>,
     add_item: Option<String>,
     error: Option<String>,
+    popup_item: Option<String>,
+    popup_position: Option<Pos2>,
 }
 
 impl Workspace {
@@ -58,6 +60,7 @@ impl Workspace {
             buttons::compact_style(ui);
             ui.label("Folder");
             AppComboBox::new(&self.theme, "library-folder-filter")
+                .height(260.0_f32)
                 .width(210.)
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
@@ -106,15 +109,13 @@ impl Workspace {
             Vec2::splat(28.),
         );
         let response = folder_button(ui, folder_rect, ui.id().with((&key, "folder")), &self.theme);
-        Popup::menu(&response)
-            .id(ui.id().with((&key, "folder-menu")))
-            .frame(menu_frame(&self.theme))
-            .show(|ui| {
-                style_menu(ui, &self.theme);
-                ui.label("Move to folder");
-                ui.separator();
-                self.library_folder_destinations(ui, &key, org);
-            });
+        // Keep Fab's selector independent of card hover and Popup's transient
+        // auto-close lifecycle. ZIP already keeps its menu rendered while open.
+        // This anchored window remains interactive until a selection or outside click.
+        if response.clicked() {
+            self.library.organization.popup_item = Some(key.clone());
+            self.library.organization.popup_position = Some(pos2(folder_rect.right() + 4.0_f32, folder_rect.top()));
+        }
         let eye_rect = Rect::from_center_size(
             pos2(picture.right() - 20., picture.top() + 54.),
             Vec2::splat(28.),
@@ -136,28 +137,88 @@ impl Workspace {
         }
     }
 
+    // Render the folder selector once in the foreground, outside the virtualized
+    // library card/ScrollArea. Rendering an egui Window inside the card loop made
+    // its interaction and alpha unstable as the thumbnail hover state changed.
+    pub(super) fn library_folder_popup_overlay(&mut self, ctx: &Context) {
+        let Some(key) = self.library.organization.popup_item.clone() else {
+            return;
+        };
+        let position = self.library.organization.popup_position.unwrap_or(Pos2::ZERO);
+        let org = self.library_organization();
+        let theme = self.theme.clone();
+        let popup_rect = egui::Area::new(Id::new("fab-folder-selection-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    style_menu(ui, &theme);
+                    ui.label("Move to folder");
+                    ui.separator();
+                    self.library_folder_destinations(ui, &key, &org);
+                });
+            })
+            .response.rect;
+        let clicked_outside = ctx.input(|input| {
+            input.pointer.any_pressed()
+                && input.pointer.interact_pos().is_some_and(|pos| !popup_rect.contains(pos))
+        });
+        let selected = ctx.input(|input| {
+            input.pointer.any_released()
+                && input.pointer.interact_pos().is_some_and(|pos| popup_rect.contains(pos))
+        });
+        if clicked_outside || selected || self.library.organization.manager {
+            self.library.organization.popup_item = None;
+            self.library.organization.popup_position = None;
+        }
+    }
+
     pub(super) fn library_item_options(&mut self, ui: &mut Ui, key: &str, org: &Organization) {
         style_menu(ui, &self.theme);
         ui.label(format!("Folder: {}", org.folder(key).unwrap_or("Unfiled")));
-        ui.separator();
-        if ui
-            .add(buttons::secondary_button("Verify cached files"))
-            .clicked()
-        {
-            if let Some(item) = self
-                .library
-                .cache_items()
-                .iter()
-                .find(|item| item.key() == key)
-                .cloned()
-            {
-                self.start_cache_verification(
-                    engine_workspace::vault_health::Selection::Item(item),
-                    false,
-                    ui.ctx(),
-                );
+        let can_verify = self.library.cache_items().iter().any(|item| item.key() == key);
+        if let Some(action) = super::library_asset_menu::common_actions(ui, can_verify, org.is_hidden(key)) {
+            match action {
+                super::library_asset_menu::CommonAction::VerifyIntegrity => {
+                    if let Some(item) = self.library.cache_items().iter().find(|item| item.key() == key).cloned() {
+                        self.start_cache_verification(
+                            engine_workspace::vault_health::Selection::Item(item), false, ui.ctx(),
+                        );
+                    }
+                }
+                super::library_asset_menu::CommonAction::EditTags => {
+                    self.asset_tags.edit(format!("fab:{key}"));
+                }
+                super::library_asset_menu::CommonAction::ToggleHidden => {
+                    if let Err(error) = self.change_library_organization(|current| {
+                        current.set_hidden(key, !org.is_hidden(key));
+                        Ok(())
+                    }) {
+                        self.notify(error);
+                    }
+                }
             }
-            ui.close();
+        }
+        ui.separator();
+        if let Some(item) = self
+            .library
+            .cache_items()
+            .iter()
+            .find(|item| item.key() == key)
+            .cloned()
+        {
+            let needs_redownload =
+                self.cache_health.for_item(&item).iter().any(|record| {
+                    record.health == engine_workspace::vault_health::Health::Redownload
+                });
+            if needs_redownload
+                && ui
+                    .add(buttons::secondary_button("Re-download Asset…"))
+                    .clicked()
+            {
+                self.request_failed_vault_replacement(item);
+                ui.close();
+            }
         }
         ui.menu_button("Move to folder", |ui| {
             style_menu(ui, &self.theme);
@@ -347,6 +408,10 @@ impl Workspace {
 }
 
 impl FolderView {
+    pub(super) fn is_popup_open_for(&self, key: &str) -> bool {
+        self.popup_item.as_deref() == Some(key)
+    }
+
     pub(super) fn preview(&mut self, step: usize) {
         self.show_hidden = step >= 3;
         self.manager = step == 4;
@@ -354,7 +419,7 @@ impl FolderView {
 }
 
 /// Visibility is a direct action; its icon shows the current state.
-fn visibility_button(ui: &mut Ui, rect: Rect, id: Id, hidden: bool, theme: &Theme) -> Response {
+pub(super) fn visibility_button(ui: &mut Ui, rect: Rect, id: Id, hidden: bool, theme: &Theme) -> Response {
     let label = if hidden {
         "Show in Library"
     } else {
@@ -373,14 +438,14 @@ fn visibility_button(ui: &mut Ui, rect: Rect, id: Id, hidden: bool, theme: &Them
             ],
             false,
             Color32::TRANSPARENT,
-            Stroke::new(1.6, tint),
+            Stroke::new(1.6_f32, tint),
         ));
     }
     painter.circle_filled(center, 2.8, tint);
     if hidden {
         let slash = [center + vec2(-8., 9.), center + vec2(8., -9.)];
-        painter.line_segment(slash, Stroke::new(4.5, fill));
-        painter.line_segment(slash, Stroke::new(1.8, tint));
+        painter.line_segment(slash, Stroke::new(4.5_f32, fill));
+        painter.line_segment(slash, Stroke::new(1.8_f32, tint));
     }
     response.on_hover_text(label)
 }
@@ -413,7 +478,7 @@ fn thumbnail_circle_button(
     (response, fill, tint)
 }
 
-fn folder_button(ui: &mut Ui, rect: Rect, id: Id, theme: &Theme) -> Response {
+pub(super) fn folder_button(ui: &mut Ui, rect: Rect, id: Id, theme: &Theme) -> Response {
     let (response, _, tint) = thumbnail_circle_button(ui, rect, id, "Move to folder", theme);
     let center = rect.center();
     let points = [
@@ -428,6 +493,6 @@ fn folder_button(ui: &mut Ui, rect: Rect, id: Id, theme: &Theme) -> Response {
     .map(|(x, y)| center + vec2(x, y))
     .collect();
     ui.painter()
-        .add(Shape::closed_line(points, Stroke::new(1.6, tint)));
+        .add(Shape::closed_line(points, Stroke::new(1.6_f32, tint)));
     response.on_hover_text("Move to folder")
 }

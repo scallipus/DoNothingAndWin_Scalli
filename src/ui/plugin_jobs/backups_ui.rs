@@ -182,7 +182,7 @@ impl Workspace {
                     ui.push_id(&backup.id, |ui| {
                         Frame::new()
                             .fill(color(theme.card))
-                            .stroke(Stroke::new(1., color(theme.border)))
+                            .stroke(Stroke::new(1_f32, color(theme.border)))
                             .corner_radius(6.)
                             .inner_margin(14.)
                             .show(ui, |ui| {

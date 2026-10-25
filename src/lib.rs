@@ -19,8 +19,10 @@ pub mod fab;
 pub mod fab_listing;
 pub mod fab_offers;
 pub mod fab_search;
+pub mod install_staging;
 pub mod library_organization;
 pub mod vault_cache;
+pub mod vault_fingerprint;
 pub mod vault_health;
 
 pub mod project_backup;
@@ -31,6 +33,13 @@ pub mod download_policy;
 
 pub mod instance;
 
+pub mod engine_cache;
 pub mod engine_operation;
 pub mod engine_update;
 pub mod epic_registration;
+
+// Legacy Vault transfer and read-only scanner used by the custom downloader.
+pub mod vault_download;
+pub mod vault_scan;
+
+pub mod custom_zip_cache;

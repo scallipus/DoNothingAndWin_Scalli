@@ -64,7 +64,7 @@ pub(super) fn show_with_icon(
                 widget.corner_radius = CornerRadius::same(6);
                 widget.expansion = 0.;
             }
-            visuals.widgets.inactive.bg_stroke = Stroke::new(1., color(theme.border));
+            visuals.widgets.inactive.bg_stroke = Stroke::new(1_f32, color(theme.border));
             visuals.widgets.inactive.weak_bg_fill = color(theme.card);
             visuals.widgets.hovered.weak_bg_fill = color([234, 189, 93]);
             visuals.widgets.active.weak_bg_fill = color([234, 189, 93]);
@@ -97,7 +97,7 @@ pub(super) fn show_with_icon(
                 ui.painter().rect_stroke(
                     icon,
                     3.,
-                    Stroke::new(2., color(theme.text)),
+                    Stroke::new(2_f32, color(theme.text)),
                     StrokeKind::Inside,
                 );
                 ui.painter()
@@ -105,7 +105,7 @@ pub(super) fn show_with_icon(
                 ui.painter().rect_stroke(
                     icon.translate(vec2(7., 7.)),
                     3.,
-                    Stroke::new(2., color(theme.text)),
+                    Stroke::new(2_f32, color(theme.text)),
                     StrokeKind::Inside,
                 );
             }
@@ -135,14 +135,14 @@ pub(super) fn show_with_icon(
             });
             ui.painter().line_segment(
                 [x.min + vec2(6., 6.), x.max - vec2(6., 6.)],
-                Stroke::new(2., col),
+                Stroke::new(2_f32, col),
             );
             ui.painter().line_segment(
                 [
                     pos2(x.left() + 6., x.bottom() - 6.),
                     pos2(x.right() - 6., x.top() + 6.),
                 ],
-                Stroke::new(2., col),
+                Stroke::new(2_f32, col),
             );
             close = hover
                 .clone()
@@ -228,7 +228,7 @@ pub(super) fn footer(ui: &mut Ui, theme: &Theme, label: &str, enabled: bool, dan
 pub(super) fn info(ui: &mut Ui, theme: &Theme, label: &str, value: &str) {
     Frame::new()
         .fill(color(theme.card))
-        .stroke(Stroke::new(1., color(theme.border)))
+        .stroke(Stroke::new(1_f32, color(theme.border)))
         .corner_radius(6.)
         .inner_margin(16)
         .show(ui, |ui| {

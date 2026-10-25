@@ -355,6 +355,16 @@ pub fn package(
     item: &Item,
     version: &Version,
 ) -> Result<(buildpatch::Manifest, Vec<reqwest::Url>), String> {
+    package_with_raw(session, item, version).map(|(manifest, bases, _)| (manifest, bases))
+}
+
+/// Return the verified original Fab manifest bytes as well as its parsed form.
+/// Vault packages must retain these bytes, rather than serializing the parsed manifest.
+pub fn package_with_raw(
+    session: &Session,
+    item: &Item,
+    version: &Version,
+) -> Result<(buildpatch::Manifest, Vec<reqwest::Url>, Vec<u8>), String> {
     validate_artifact_id(&version.artifact_id)?;
     let info = Epic::new()?.fab_request(session, &format!("artifacts/{}/manifest",version.artifact_id), Some(&serde_json::json!({"item_id":item.asset_id,"namespace":item.asset_namespace,"platform":"Windows"})))?;
     let info = info["downloadInfo"]
@@ -390,15 +400,13 @@ pub fn package(
                     .map(|b| format!("{b:02x}"))
                     .collect::<String>();
                 if hash.eq_ignore_ascii_case(expected) {
-                    manifest = Some(buildpatch::parse(&raw)?);
+                    manifest = Some((buildpatch::parse(&raw)?, raw));
                 }
             }
         }
     }
-    Ok((
-        manifest.ok_or("Could not download a verified Fab manifest")?,
-        bases,
-    ))
+    let (manifest, raw) = manifest.ok_or("Could not download a verified Fab manifest")?;
+    Ok((manifest, bases, raw))
 }
 
 // Only content is imported into an existing project; never its configuration or source.
@@ -482,6 +490,11 @@ fn install_package(
     let package_result = package();
     control.check()?;
     let (manifest, bases) = package_result?;
+    if manifest.app != version.artifact_id {
+        return Err(
+            "Fab manifest artifact does not match the requested engine-specific release".into(),
+        );
+    }
     if !item.plugin()
         && manifest
             .files
@@ -564,6 +577,12 @@ fn install_package(
     if fs2::available_space(&target).map_err(|e| e.to_string())? < bytes + 64 * 1024 * 1024 {
         return Err("Not enough disk space".into());
     }
+    // Resolve the exact engine-specific artifact, never a product-name match.
+    let mut cached = crate::install_staging::CachedPackage::find(&manifest)?;
+    if let Some(cache) = cached.as_mut() {
+        let selected: Vec<_> = files.iter().map(|(f, _)| *f).collect();
+        cache.prepare(&selected, control, &progress)?;
+    }
     let stage = target.join(format!(
         ".engine-workspace-fab-{}",
         std::time::SystemTime::now()
@@ -578,32 +597,45 @@ fn install_package(
         let mut downloaded = 0u64;
         for (i, (file, relative)) in files.iter().enumerate() {
             control.check()?;
-            progress(format!("Downloading {} / {} files", i + 1, files.len()));
+            progress(format!(
+                "{} {} / {} files",
+                if cached.is_some() {
+                    "Installing cached"
+                } else {
+                    "Downloading"
+                },
+                i + 1,
+                files.len()
+            ));
             let path = stage.join(relative);
             fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             let mut file_downloaded = 0;
             let mut last_report = std::time::Instant::now();
-            crate::plugins::payload_to_file_controlled(
-                &manifest,
-                &bases,
-                file,
-                &mut cache,
-                &path,
-                control,
-                &mut |written, received| {
-                    file_downloaded = received;
-                    if last_report.elapsed().as_millis() >= 150 || written == file.size() {
-                        progress(transfer_status(
-                            i + 1,
-                            files.len(),
-                            prepared + written,
-                            bytes,
-                            downloaded + received,
-                        ));
-                        last_report = std::time::Instant::now();
-                    }
-                },
-            )?;
+            if let Some(cached) = cached.as_ref() {
+                cached.copy(file, &path, control)?;
+            } else {
+                crate::plugins::payload_to_file_controlled(
+                    &manifest,
+                    &bases,
+                    file,
+                    &mut cache,
+                    &path,
+                    control,
+                    &mut |written, received| {
+                        file_downloaded = received;
+                        if last_report.elapsed().as_millis() >= 150 || written == file.size() {
+                            progress(transfer_status(
+                                i + 1,
+                                files.len(),
+                                prepared + written,
+                                bytes,
+                                downloaded + received,
+                            ));
+                            last_report = std::time::Instant::now();
+                        }
+                    },
+                )?;
+            }
             prepared += file.size();
             downloaded += file_downloaded;
         }
@@ -940,12 +972,22 @@ pub fn create_project_with_control(
     let package_result = package(session, item, version);
     control.check()?;
     let (manifest, bases) = package_result?;
+    if manifest.app != version.artifact_id {
+        return Err(
+            "Fab manifest artifact does not match the requested engine-specific release".into(),
+        );
+    }
     let files = template_files(&manifest)?;
     let bytes: u64 = files.iter().map(|(f, _)| f.size()).sum();
     if fs2::available_space(&parent).map_err(|e| e.to_string())?
         < bytes.saturating_add(64 * 1024 * 1024)
     {
         return Err("Not enough disk space".into());
+    }
+    let mut cached = crate::install_staging::CachedPackage::find(&manifest)?;
+    if let Some(cache) = cached.as_mut() {
+        let selected: Vec<_> = files.iter().map(|(f, _)| *f).collect();
+        cache.prepare(&selected, control, &progress)?;
     }
     // Reserve the destination exclusively. Other folders, including existing projects, are untouched.
     let _change = crate::vault_health::changing(&destination);
@@ -958,7 +1000,12 @@ pub fn create_project_with_control(
         for (i, (file, relative)) in files.iter().enumerate() {
             control.check()?;
             progress(format!(
-                "Downloading project file {} / {}",
+                "{} project file {} / {}",
+                if cached.is_some() {
+                    "Installing cached"
+                } else {
+                    "Downloading"
+                },
                 i + 1,
                 files.len()
             ));
@@ -967,27 +1014,31 @@ pub fn create_project_with_control(
             fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             let mut file_downloaded = 0;
             let mut last_report = std::time::Instant::now();
-            crate::plugins::payload_to_file_controlled(
-                &manifest,
-                &bases,
-                file,
-                &mut cache,
-                &path,
-                control,
-                &mut |written, received| {
-                    file_downloaded = received;
-                    if last_report.elapsed().as_millis() >= 150 || written == file.size() {
-                        progress(transfer_status(
-                            i + 1,
-                            files.len(),
-                            prepared + written,
-                            bytes,
-                            downloaded + received,
-                        ));
-                        last_report = std::time::Instant::now();
-                    }
-                },
-            )?;
+            if let Some(cached) = cached.as_ref() {
+                cached.copy(file, &path, control)?;
+            } else {
+                crate::plugins::payload_to_file_controlled(
+                    &manifest,
+                    &bases,
+                    file,
+                    &mut cache,
+                    &path,
+                    control,
+                    &mut |written, received| {
+                        file_downloaded = received;
+                        if last_report.elapsed().as_millis() >= 150 || written == file.size() {
+                            progress(transfer_status(
+                                i + 1,
+                                files.len(),
+                                prepared + written,
+                                bytes,
+                                downloaded + received,
+                            ));
+                            last_report = std::time::Instant::now();
+                        }
+                    },
+                )?;
+            }
             prepared += file.size();
             downloaded += file_downloaded;
             if path

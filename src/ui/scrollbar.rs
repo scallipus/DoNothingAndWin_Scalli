@@ -127,6 +127,10 @@ impl AppComboBox {
         self.combo = self.combo.width(width);
         self
     }
+    pub fn height(mut self, height: f32) -> Self {
+        self.combo = self.combo.height(height);
+        self
+    }
     pub fn bounded_width(mut self, width: f32) -> Self {
         self.combo = self.combo.width(width);
         self.text_width = Some(width);

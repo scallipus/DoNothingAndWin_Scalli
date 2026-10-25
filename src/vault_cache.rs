@@ -101,6 +101,16 @@ fn enumerate(
             }
         };
         let path = child.path();
+        // The optional engine payload repository is not a Fab package. Never
+        // expose it as a removable asset card or include it in Fab scan counts.
+        if dir == root
+            && child
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".EngineCache")
+        {
+            continue;
+        }
         if let Err(e) = crate::installer::no_links(&path) {
             out.warnings
                 .push(format!("Skipped {}: {e}", path.display()));

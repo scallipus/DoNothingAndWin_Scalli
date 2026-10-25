@@ -132,7 +132,7 @@ impl Activity {
         textures: &HashMap<String, TextureHandle>,
         bordered: bool,
     ) {
-        Frame::new().fill(color(t.card)).stroke(if bordered { Stroke::new(1., color(t.border)) } else { Stroke::NONE })
+        Frame::new().fill(color(t.card)).stroke(if bordered { Stroke::new(1_f32, color(t.border)) } else { Stroke::NONE })
             .corner_radius(10.).inner_margin(16).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(10., 5.);
                 ui.spacing_mut().interact_size.y = 20.;
@@ -234,7 +234,7 @@ impl Activity {
         }
         ui.painter().add(Shape::mesh(mesh));
         ui.painter()
-            .add(Shape::line(points, Stroke::new(1.5, accent)));
+            .add(Shape::line(points, Stroke::new(1.5_f32, accent)));
         ui.painter().text(
             r.min + vec2(4., 16.),
             Align2::LEFT_CENTER,
@@ -252,7 +252,7 @@ impl Activity {
         if index > 0 {
             ui.painter().line_segment(
                 [r.left_top(), r.left_bottom()],
-                Stroke::new(1., color(t.border).gamma_multiply(0.5)),
+                Stroke::new(1_f32, color(t.border).gamma_multiply(0.5)),
             );
         }
         response.on_hover_text(match index {

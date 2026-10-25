@@ -373,7 +373,28 @@ pub fn install(
     control: &Control,
     progress: Arc<Mutex<Progress>>,
 ) -> Result<PathBuf, String> {
-    install_from(plan, control, progress, None)
+    install_from(plan, control, progress, None, None, false)
+}
+
+/// Preserve the verified payload chunks for the exact engine build and selected components.
+/// A completed cache is never replaced by this operation.
+pub fn install_with_engine_cache(
+    plan: &Plan,
+    control: &Control,
+    progress: Arc<Mutex<Progress>>,
+    cache_root: &Path,
+) -> Result<PathBuf, String> {
+    install_from(plan, control, progress, None, Some(cache_root), false)
+}
+
+/// Reinstall from a completed, exact-build cache without requesting chunks from Epic.
+pub fn install_from_engine_cache(
+    plan: &Plan,
+    control: &Control,
+    progress: Arc<Mutex<Progress>>,
+    cache_root: &Path,
+) -> Result<PathBuf, String> {
+    install_from(plan, control, progress, None, Some(cache_root), true)
 }
 
 /// Build a complete replacement beside the installed engine, reusing verified files.
@@ -384,7 +405,7 @@ pub(crate) fn stage_update(
     control: &Control,
     progress: Arc<Mutex<Progress>>,
 ) -> Result<PathBuf, String> {
-    install_from(plan, control, progress, Some(source))
+    install_from(plan, control, progress, Some(source), None, false)
 }
 
 fn install_from(
@@ -392,6 +413,8 @@ fn install_from(
     control: &Control,
     progress: Arc<Mutex<Progress>>,
     source: Option<&Path>,
+    engine_cache_root: Option<&Path>,
+    offline_cache_only: bool,
 ) -> Result<PathBuf, String> {
     crate::download_policy::check_install_allowed()?;
     validate_manifest(&plan.manifest)?;
@@ -430,7 +453,23 @@ fn install_from(
         .map_err(|e| e.to_string())?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| "Another installer is using this build")?;
     let stage = work.join("files");
-    let cache = work.join("chunks");
+    let preserved = engine_cache_root
+        .map(|root| crate::engine_cache::build_folder(root, &plan.manifest, &plan.selected));
+    if let Some(folder) = &preserved {
+        if offline_cache_only {
+            crate::engine_cache::verify_complete(folder, &plan.manifest, &plan.selected)?;
+        } else {
+            crate::engine_cache::check_vacant_or_incomplete(
+                folder,
+                &plan.manifest,
+                &plan.selected,
+            )?;
+        }
+    }
+    let cache = preserved
+        .as_ref()
+        .map(|folder| folder.join("chunks"))
+        .unwrap_or_else(|| work.join("chunks"));
     no_links(&stage)?;
     no_links(&cache)?;
     fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
@@ -553,6 +592,12 @@ fn install_from(
                             && read_payload(&path, &progress)
                                 .is_ok_and(|bytes| buildpatch::valid_chunk_data(&bytes, chunk));
                         if !cached {
+                            if offline_cache_only {
+                                return Err(format!(
+                                    "Preserved engine cache chunk is missing or corrupt: {}",
+                                    chunk.guid
+                                ));
+                            }
                             let bytes = chunk_data_progress(
                                 &client,
                                 chunk,
@@ -682,9 +727,15 @@ fn install_from(
         p.phase = "Cleaning up downloaded chunk cache".into();
         p.total = 0;
     }
-    for id in needed {
-        let p = cache.join(id);
-        let _ = fs::remove_file(p);
+    if let Some(folder) = &preserved {
+        if !offline_cache_only {
+            crate::engine_cache::mark_complete(folder, &plan.manifest, &plan.selected)?;
+        }
+    } else {
+        for id in needed {
+            let p = cache.join(id);
+            let _ = fs::remove_file(p);
+        }
     }
     progress.lock().unwrap().phase = if source.is_some() {
         "Update files prepared - final verification pending"

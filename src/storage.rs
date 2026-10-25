@@ -189,8 +189,24 @@ pub struct Preferences {
     pub display_name: String,
     pub install_root: String,
     pub fab_cache: String,
+
     pub vault_cache_paths: Vec<String>,
     pub ask_vault_cache: bool,
+    /// Default completed-package Vault root, independent from the download chunk cache.
+    pub default_vault_cache: String,
+    /// When true, reusable chunks follow the default completed-package Vault root.
+    pub chunk_cache_uses_vault_cache: bool,
+    /// Launcher-managed local scratch root for installs sourced from network Vaults.
+    pub local_install_staging_root: String,
+
+    /// Existing Epic Games Launcher Vault Cache root, separate from the Fab chunk cache.
+    #[serde(skip_serializing)]
+    pub vault_cache: String,
+    /// Read-only archive roots for the future Custom Asset Cache.
+    pub custom_asset_caches: Vec<String>,
+    /// 0 = original card proportions; otherwise a predefined square thumbnail size.
+    pub library_thumbnail_size: u16,
+
     pub project_roots: Vec<String>,
     pub manual_projects: Vec<String>,
 }
@@ -231,8 +247,17 @@ impl Default for Preferences {
             display_name: "Developer".into(),
             install_root: "C:/Program Files/Epic Games".into(),
             fab_cache: "C:/ProgramData/Epic/EpicGamesLauncher/VaultCache".into(),
+
             vault_cache_paths: vec![],
             ask_vault_cache: true,
+            default_vault_cache: "C:/ProgramData/Epic/EpicGamesLauncher/VaultCache".into(),
+            chunk_cache_uses_vault_cache: true,
+            local_install_staging_root: data_dir().join("Staging").to_string_lossy().into_owned(),
+
+            vault_cache: "C:/ProgramData/Epic/EpicGamesLauncher/VaultCache".into(),
+            custom_asset_caches: vec![],
+            library_thumbnail_size: 0,
+
             project_roots: vec![],
             manual_projects: vec![],
         }
@@ -254,12 +279,72 @@ pub struct SavedView {
 impl Preferences {
     pub fn vault_cache_roots(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        std::iter::once(&self.fab_cache)
+        std::iter::once(&self.default_vault_cache)
             .chain(&self.vault_cache_paths)
             .filter(|path| !path.trim().is_empty())
             .filter(|path| seen.insert(crate::discovery::path_key(Path::new(path))))
             .cloned()
             .collect()
+    }
+
+    /// The active chunk location. Existing queued jobs retain their captured path.
+    pub fn chunk_cache_root(&self) -> &str {
+        if self.chunk_cache_uses_vault_cache {
+            &self.default_vault_cache
+        } else {
+            &self.fab_cache
+        }
+    }
+
+    /// Upgrade old preferences without moving or touching any cache files.
+    pub fn migrate_cache_locations(&mut self, raw: &serde_json::Value) {
+        if raw.get("default_vault_cache").is_none() {
+            // Older custom builds had a dedicated Epic Vault root; upstream 1.3.2 used fab_cache.
+            let legacy = raw
+                .get("vault_cache")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.trim().is_empty());
+            let upstream = raw
+                .get("fab_cache")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.trim().is_empty());
+            let default_legacy = Preferences::default().vault_cache;
+            let legacy = legacy.filter(|p| {
+                upstream.is_none()
+                    || crate::discovery::path_key(Path::new(p))
+                        != crate::discovery::path_key(Path::new(&default_legacy))
+            });
+            self.default_vault_cache = legacy
+                .or(upstream)
+                .unwrap_or(&self.default_vault_cache)
+                .to_owned();
+            // Respect an existing separate chunk-cache configuration on upgrades.
+            self.chunk_cache_uses_vault_cache = upstream.is_none_or(|p| {
+                crate::discovery::path_key(Path::new(p))
+                    == crate::discovery::path_key(Path::new(&self.default_vault_cache))
+            });
+            if let Some(path) = upstream {
+                if crate::discovery::path_key(Path::new(path))
+                    != crate::discovery::path_key(Path::new(&self.default_vault_cache))
+                    && raw.get("vault_cache").is_none()
+                {
+                    // For upstream-only preferences, the old default was the Fab location.
+                    self.vault_cache_paths.insert(0, path.to_owned());
+                }
+            }
+        }
+        // Keep legacy custom Vault packages discoverable even after switching defaults.
+        if let Some(old) = raw.get("vault_cache").and_then(|v| v.as_str()) {
+            let key = crate::discovery::path_key(Path::new(old));
+            if !old.trim().is_empty()
+                && !self
+                    .vault_cache_roots()
+                    .iter()
+                    .any(|p| crate::discovery::path_key(Path::new(p)) == key)
+            {
+                self.vault_cache_paths.push(old.to_owned());
+            }
+        }
     }
 
     pub fn add_vault_cache(&mut self, path: &str) -> Result<(), String> {
@@ -289,7 +374,7 @@ impl Preferences {
             return;
         }
         roots.retain(|root| crate::discovery::path_key(Path::new(root)) != key);
-        self.fab_cache = path.into();
+        self.default_vault_cache = path.into();
         self.vault_cache_paths = roots;
     }
 
@@ -307,12 +392,35 @@ impl Preferences {
     }
 }
 pub fn load_preferences() -> Preferences {
-    read_json(&data_dir().join("preferences.json")).unwrap_or_default()
+    let path = data_dir().join("preferences.json");
+    if let Ok(bytes) = fs::read(path) {
+        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Ok(mut prefs) = serde_json::from_value::<Preferences>(raw.clone()) {
+                prefs.migrate_cache_locations(&raw);
+                return prefs;
+            }
+        }
+    }
+    Preferences::default()
 }
 
 #[cfg(test)]
 mod cache_location_tests {
     use super::*;
+    #[test]
+    fn legacy_separate_vault_is_visible_to_shared_inventory_and_verifier() {
+        let chunks = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let prefs = Preferences {
+            fab_cache: chunks.path().to_string_lossy().into_owned(),
+            vault_cache: vault.path().to_string_lossy().into_owned(),
+            ..Preferences::default()
+        };
+        let roots = prefs.vault_cache_roots();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|p| Path::new(p) == vault.path()));
+        assert!(roots.iter().any(|p| Path::new(p) == chunks.path()));
+    }
     #[test]
     fn cache_locations_migrate_deduplicate_and_switch_default_without_deleting_files() {
         let first = tempfile::tempdir().unwrap();
@@ -321,6 +429,7 @@ mod cache_location_tests {
         let mut prefs: Preferences =
             serde_json::from_value(serde_json::json!({"fab_cache":first.path()})).unwrap();
         assert!(prefs.ask_vault_cache);
+        prefs.vault_cache = first.path().to_string_lossy().into_owned();
         assert_eq!(prefs.vault_cache_roots().len(), 1);
         prefs
             .add_vault_cache(&second.path().to_string_lossy())
@@ -343,7 +452,7 @@ mod cache_location_tests {
         let chosen = second.path().to_string_lossy().into_owned();
         assert_eq!(prefs.vault_download_root(&chosen), Some(chosen.clone()));
         prefs.set_default_vault_cache(&chosen);
-        assert_eq!(prefs.fab_cache, chosen);
+        assert_eq!(prefs.default_vault_cache, chosen);
         assert_eq!(prefs.vault_cache_roots().len(), 2);
         prefs.ask_vault_cache = false;
         assert_eq!(prefs.vault_download_root(""), Some(chosen));

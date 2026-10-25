@@ -4,6 +4,8 @@ use engine_workspace::fab_listing::{self, DateEvent, Sort};
 use engine_workspace::fab_search::{SearchDocument, SearchQuery};
 mod plugin_download;
 const AVAILABLE_UPDATES_FILTER: usize = 4;
+const CACHED_FILTER: usize = 5;
+const UNCACHED_FILTER: usize = 6;
 type KindResult = (String, String, Result<fab::project_kind::Detection, String>);
 
 enum Event {
@@ -17,6 +19,7 @@ enum Event {
     PluginBatchFinished(Result<String, String>),
     PluginDownloadProgress(fab::plugin_download::Progress),
     PluginDownloaded(Result<std::path::PathBuf, String>),
+    VaultFinished(Result<String, String>, String),
 }
 enum UpdateEvent {
     Plugin(String, Instant, engine_workspace::plugins::Checked),
@@ -28,12 +31,51 @@ enum UpdateEvent {
     Projects(std::collections::HashMap<String, Vec<(String, String)>>),
     Finished,
 }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct VaultJob {
+    item: Item,
+    version: fab::Version,
+    root: String,
+    mode: engine_workspace::vault_download::VaultMode,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    chunk_cache: String,
+    #[serde(default)]
+    stage_name: String,
+}
+#[derive(Clone, Debug)]
+enum VerifyState {
+    Checking,
+    Passed,
+}
+
 #[derive(Default)]
 pub(super) struct Library {
     pub(super) catalogue: engine_workspace::plugins::catalogue::Catalogue,
     pub(super) organization: super::library_folders::FolderView,
     account: String,
     pub(super) install_queue: super::library_queue::Queue,
+
+    vault_queue: std::collections::VecDeque<VaultJob>,
+    vault_in_progress: Option<VaultJob>,
+    vault_pause_requested: bool,
+    pub(super) vault_queue_held: bool,
+    vault_cancel_requested: bool,
+    vault_progress: Option<(u64, u64)>,
+    verification: std::collections::HashMap<String, VerifyState>,
+    verify_rx: Option<
+        Receiver<(
+            String,
+            Result<engine_workspace::vault_scan::VaultVerify, String>,
+        )>,
+    >,
+    replace_dialog: Option<VaultJob>,
+    backup_selected: bool,
+    backup_folder: String,
+    vault_active: Option<String>,
+
     items: Vec<Item>,
     rx: Option<Receiver<Event>>,
     kind_rx: Option<Receiver<KindResult>>,
@@ -75,6 +117,145 @@ pub(super) struct Library {
     image_attempts: std::collections::HashSet<String>,
 }
 impl Library {
+    fn vault_queue_path() -> std::path::PathBuf {
+        engine_workspace::storage::data_dir().join("vault-download-queue.json")
+    }
+    fn save_vault_queue(&self) {
+        let mut jobs: Vec<VaultJob> = self.vault_queue.iter().cloned().collect();
+        if let Some(active) = &self.vault_in_progress {
+            let mut job = active.clone();
+            job.paused = true; // Interrupted jobs must require explicit user resume.
+            jobs.insert(0, job);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&jobs) {
+            if let Err(e) =
+                engine_workspace::storage::write_atomic(&Self::vault_queue_path(), &bytes)
+            {
+                eprintln!("Could not persist Vault queue: {e}");
+            }
+        }
+    }
+    pub(super) fn restore_vault_queue() -> Self {
+        let mut library = Self::default();
+        if let Ok(bytes) = std::fs::read(Self::vault_queue_path()) {
+            match serde_json::from_slice::<Vec<VaultJob>>(&bytes) {
+                Ok(mut jobs) => {
+                    for job in &mut jobs {
+                        job.paused = true;
+                    }
+                    library.vault_queue = jobs.into();
+                }
+                Err(e) => eprintln!("Could not restore Vault queue: {e}"),
+            }
+        }
+        library
+    }
+    pub(super) fn pause_active_vault(&mut self) {
+        if self.vault_in_progress.is_some()
+            && !self.vault_pause_requested
+            && !self.vault_cancel_requested
+        {
+            self.vault_pause_requested = true;
+            // A user pause holds the entire Vault queue until explicit Resume.
+            self.vault_queue_held = true;
+            if let Some(control) = &self.install_control {
+                control.stop();
+            }
+            self.save_vault_queue();
+        }
+    }
+    pub(super) fn cancel_active_vault(&mut self) {
+        if self.vault_in_progress.is_some() && !self.vault_cancel_requested {
+            self.vault_cancel_requested = true;
+            self.vault_pause_requested = false;
+            if let Some(control) = &self.install_control {
+                control.stop();
+            }
+        }
+    }
+    pub(super) fn active_vault(&self) -> Option<(Item, String, String, Option<(u64, u64)>)> {
+        self.vault_in_progress.as_ref().map(|job| {
+            (
+                job.item.clone(),
+                job.version.artifact_id.clone(),
+                job.root.clone(),
+                self.vault_progress,
+            )
+        })
+    }
+    pub(super) fn resume_vault_waiting(&mut self, index: usize) {
+        // An explicit Play/Resume restarts the entire Vault queue. The chosen
+        // job runs first; the other waiting jobs become eligible to run after it.
+        // Pausing an active transfer still holds the queue until this action.
+        if index >= self.vault_queue.len() {
+            return;
+        }
+        if let Some(job) = self.vault_queue.remove(index) {
+            self.vault_queue.push_front(job);
+        }
+        for job in &mut self.vault_queue {
+            job.paused = false;
+        }
+        self.vault_queue_held = false;
+        self.save_vault_queue();
+    }
+    pub(super) fn retry_failed_vault_download(
+        &mut self,
+        title: &str,
+        destination: &str,
+        chunk_cache: &str,
+    ) -> Result<(), String> {
+        let candidates: Vec<Item> = self
+            .items
+            .iter()
+            .filter(|item| item.title == title)
+            .cloned()
+            .collect();
+        let item =
+            match candidates.as_slice() {
+                [item] => item.clone(),
+                [] => {
+                    return Err(
+                        "Asset not found in the current Library. Sync Library and retry.".into(),
+                    );
+                }
+                _ => return Err(
+                    "Multiple Library assets have this title; retry from the asset card instead."
+                        .into(),
+                ),
+            };
+        let branch = item
+            .supported_branches()
+            .last()
+            .cloned()
+            .ok_or("No compatible Fab package version available.")?;
+        let version = item
+            .compatible(&branch)
+            .ok_or("No compatible Fab package version available.")?;
+        if self.vault_active.as_deref() == Some(version.artifact_id.as_str())
+            || self
+                .vault_queue
+                .iter()
+                .any(|job| job.version.artifact_id == version.artifact_id)
+        {
+            return Err("This asset is already active or queued.".into());
+        }
+        if destination.is_empty() || !std::path::Path::new(destination).is_dir() {
+            return Err("The original Vault destination is unavailable; retry from the Library after choosing a valid cache path.".into());
+        }
+        self.vault_queue.push_back(VaultJob {
+            item,
+            version,
+            root: destination.to_owned(),
+            mode: engine_workspace::vault_download::VaultMode::New,
+            paused: false,
+            chunk_cache: chunk_cache.to_owned(),
+            stage_name: String::new(),
+        });
+        self.save_vault_queue();
+        Ok(())
+    }
+
     pub(super) fn cache_items(&self) -> &[Item] {
         &self.items
     }
@@ -83,6 +264,44 @@ impl Library {
             .iter()
             .any(|item| fab_listing::listing_id(item).as_deref() == Some(id))
     }
+
+    pub(super) fn vault_jobs(&self) -> Vec<(Item, String, String, bool)> {
+        self.vault_queue
+            .iter()
+            .map(|j| {
+                (
+                    j.item.clone(),
+                    j.version.artifact_id.clone(),
+                    j.root.clone(),
+                    j.paused,
+                )
+            })
+            .collect()
+    }
+    pub(super) fn move_vault_waiting(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.vault_queue.len() || to >= self.vault_queue.len() {
+            return;
+        }
+        if let Some(job) = self.vault_queue.remove(from) {
+            self.vault_queue.insert(to, job);
+            self.save_vault_queue();
+        }
+    }
+    pub(super) fn remove_vault_waiting(&mut self, index: usize) {
+        if let Some(job) = self.vault_queue.remove(index) {
+            if !job.stage_name.is_empty() {
+                if let Err(e) = engine_workspace::vault_download::cleanup_staged_job(
+                    Path::new(&job.root),
+                    &job.version.artifact_id,
+                    &job.stage_name,
+                ) {
+                    eprintln!("Cancelled queued Vault staging cleanup: {e}");
+                }
+            }
+        }
+        self.save_vault_queue();
+    }
+
     pub(super) fn transfer_controls(&self, ui: &mut Ui) {
         if let Some(control) = &self.install_control {
             let stopping = control.cancel.load(std::sync::atomic::Ordering::Relaxed);
@@ -226,25 +445,38 @@ impl Workspace {
                     .filter(|r| r.has_update())
                     .map(|r| r.plugin.name.as_str())
                     .collect();
-                (!names.is_empty()).then(|| (i, format!("UE {} - {}", e.version, names.join(", "))))
+                (!names.is_empty()).then(|| (i, e.version.clone(), names.join(", "), names.len()))
             })
             .collect();
         if updates.is_empty() {
             return;
         }
-        ui.horizontal_wrapped(|ui| {
+        // Keep update controls on one bounded line. A long list of plugin names must
+        // never wrap into a tall column and push the Library grid off screen.
+        ui.horizontal(|ui| {
             ui.label(RichText::new("Plugin updates available:").color(color(self.theme.warning)));
-            for (i, label) in updates {
-                if ui
-                    .add(buttons::secondary_button(label))
-                    .on_hover_text("View plugin updates for this engine")
-                    .clicked()
-                {
-                    self.show_plugins(i);
-                    self.plugin_updates_only = true;
-                    self.check_plugins(ui.ctx().clone());
-                }
-            }
+            egui::ScrollArea::horizontal()
+                .id_salt("library-plugin-update-links")
+                .max_height(42.)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, version, names, count) in updates {
+                            let label = format!("UE {version} ({count})");
+                            if ui
+                                .add(buttons::secondary_button(label))
+                                .on_hover_text(format!(
+                                    "View plugin updates for this engine: {names}"
+                                ))
+                                .clicked()
+                            {
+                                self.show_plugins(i);
+                                self.plugin_updates_only = true;
+                                self.check_plugins(ui.ctx().clone());
+                            }
+                        }
+                    });
+                });
         });
     }
 
@@ -383,6 +615,27 @@ impl Workspace {
             })
         });
     }
+    /// Refresh the read-only Vault inventory in a worker. Never block a UI frame
+    /// on network-backed Vault enumeration.
+    fn request_vault_inventory_refresh(&mut self, ctx: &Context) {
+        if self.vault_discovery.rx.is_some() {
+            return;
+        }
+        let root = self.prefs.default_vault_cache.clone();
+        if !std::path::Path::new(&root).is_dir() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.vault_discovery.path = root.clone();
+        self.vault_discovery.rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = engine_workspace::vault_scan::scan(std::path::Path::new(&root));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
     pub(super) fn poll_library(&mut self, ctx: &Context) {
         let account = self
             .session
@@ -401,11 +654,17 @@ impl Workspace {
                 let _ = tx.send(Event::Cached(fab::load_library_cache(&cached_account)));
                 context.request_repaint();
             });
+            // Account initialization must not discard the Vault jobs restored at
+            // startup.  The queue is stored independently from the Fab catalogue,
+            // including its resumable staging identities and destination paths.
+            // Persist the old state first (also captures an interrupted active job)
+            // and restore it when rebuilding the account-scoped Library view.
+            self.library.save_vault_queue();
             self.library = Library {
                 rx: Some(rx),
                 account,
-                sort: self.prefs.library_sort,
-                ..Default::default()
+
+                ..Library::restore_vault_queue()
             };
             self.textures.retain(|key, _| !key.starts_with("fab:"));
         }
@@ -455,7 +714,20 @@ impl Workspace {
                         self.rebuild_library_search();
                     }
                 }
-                Event::Status(s) => self.library.status = s,
+                Event::Status(s) => {
+                    if self.library.vault_in_progress.is_some() {
+                        if let Some(bytes) = s.split('·').nth(1) {
+                            let nums: Vec<u64> = bytes
+                                .split('/')
+                                .filter_map(|p| p.trim().split_whitespace().next()?.parse().ok())
+                                .collect();
+                            if nums.len() == 2 && nums[1] > 0 {
+                                self.library.vault_progress = Some((nums[0].min(nums[1]), nums[1]));
+                            }
+                        }
+                    }
+                    self.library.status = s;
+                }
                 Event::AcquisitionError(error) => self.library.acquisition_error = Some(error),
                 Event::Loaded(result) => {
                     self.library.loading = false;
@@ -559,6 +831,63 @@ impl Workspace {
                     });
                     self.notify(self.library.status.clone());
                 }
+
+                Event::VaultFinished(result, folder) => {
+                    // Stopping a Vault worker leaves verified chunks reusable. Paused jobs
+                    // remain in the persisted queue instead of being recorded as failures.
+                    let paused = self.library.vault_pause_requested && result.is_err();
+                    if self.library.vault_cancel_requested {
+                        if let Some(job) = &self.library.vault_in_progress {
+                            if !job.stage_name.is_empty() {
+                                if let Err(e) = engine_workspace::vault_download::cleanup_staged_job(
+                                    Path::new(&job.root),
+                                    &job.version.artifact_id,
+                                    &job.stage_name,
+                                ) {
+                                    eprintln!("Cancelled Vault staging cleanup: {e}");
+                                }
+                            }
+                        }
+                    }
+                    if paused {
+                        if let Some(mut job) = self.library.vault_in_progress.take() {
+                            job.paused = true;
+                            self.library.vault_queue.push_front(job);
+                        }
+                    }
+                    self.library.vault_pause_requested = false;
+                    self.library.vault_cancel_requested = false;
+                    self.library.vault_progress = None;
+                    if result.is_ok() {
+                        let key = format!("{}|{}", self.library.install_engine, folder);
+                        self.library.verification.insert(key, VerifyState::Passed);
+                    }
+                    if result.is_ok()
+                        && self.library.install_engine == self.prefs.default_vault_cache
+                    {
+                        self.request_vault_inventory_refresh(ctx);
+                    }
+                    if !paused {
+                        self.record_activity(
+                            self.library.install_item.clone(),
+                            self.library.install_engine.clone(),
+                            &result,
+                        );
+                    }
+                    self.library.vault_active = None;
+                    self.library.vault_in_progress = None;
+                    self.library.save_vault_queue();
+                    self.library.installing = false;
+                    self.library.install_control = None;
+                    self.library.rx = None;
+                    self.library.status = if paused {
+                        "Vault download paused; select Resume to continue.".into()
+                    } else {
+                        result.unwrap_or_else(|e| format!("Vault download failed: {e}"))
+                    };
+                    self.notify(self.library.status.clone());
+                }
+
                 Event::Installed(result) => {
                     if let Ok(message) = &result {
                         if let Some(path) = message.strip_prefix("Created project: ") {
@@ -725,7 +1054,29 @@ impl Workspace {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
+    /// Use the existing Vault-to-Fab identity links for the Cached/Uncached
+    /// tabs. This is an inventory lookup, not an additional network traversal.
+    /// Metadata-only records are not installable cached packages.
+    fn library_tab_matches(&self, item: &Item, filter: usize) -> bool {
+        match filter {
+            CACHED_FILTER | UNCACHED_FILTER => {
+                let cached = self.cache_health.for_item(item).into_iter().any(|record| {
+                    record.health != engine_workspace::vault_health::Health::MetadataOnly
+                });
+                if filter == CACHED_FILTER {
+                    cached
+                } else {
+                    !cached
+                }
+            }
+            _ => self.library.matches_filter(item, filter),
+        }
+    }
+
     pub(super) fn real_library_page(&mut self, ui: &mut Ui, c: &Canvas) {
+        let mut vault_item: Option<Item> = None;
+        let verify_request: Option<(String, String)> = None;
+        let replace_request: Option<VaultJob> = None;
         let header = PageHeaderLayout::new();
         let header_y = header.actions_y;
         if c.button(
@@ -744,7 +1095,10 @@ impl Workspace {
             link,
             egui::Hyperlink::from_label_and_url("My Fab library ↗", "https://www.fab.com/library"),
         );
-        let top = header.filters_y();
+        // The Fab/ZIP source selector occupies its own row above the existing
+        // Fab category filters. Keep the original filters below it so neither
+        // button group overlaps or becomes unclickable.
+        let top = header.filters_y() + 42.;
         if self.session.is_none() {
             ui.put(
                 c.rect([271., top + 20., 500., 40.]),
@@ -765,6 +1119,23 @@ impl Workspace {
                 .filter_map(|(index, item)| fab_listing::visible_in_library(item).then_some(index)).collect();
             let keys: Vec<_> = visible_items.iter().map(|&index| self.library.items[index].key()).collect();
             self.library_folder_toolbar(ui, &keys);
+            ui.horizontal(|ui| {
+                ui.label("Local tag filter");
+                egui::ComboBox::from_id_salt("fab-local-tags-filter")
+                    .selected_text(if self.asset_tags.filter.is_empty() { "All tags" } else { &self.asset_tags.filter })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.asset_tags.filter, String::new(), "All tags");
+                        for tag in self.asset_tags.all_tags() {
+                            ui.selectable_value(&mut self.asset_tags.filter, tag.clone(), tag);
+                        }
+                    });
+            });
+            if !self.asset_tags.filter.is_empty() {
+                visible_items.retain(|&index| {
+                    self.asset_tags.get(&format!("fab:{}", self.library.items[index].key()))
+                        .iter().any(|tag| tag.eq_ignore_ascii_case(&self.asset_tags.filter))
+                });
+            }
             let organization = self.library_organization();
             visible_items.retain(|&index| organization.matches(&self.library.items[index].key(), &self.library.organization.filter, self.library.organization.show_hidden));
             let branches = fab_listing::engine_branches(visible_items.iter().map(|&index| &self.library.items[index]));
@@ -773,11 +1144,11 @@ impl Workspace {
                 ui.spacing_mut().button_padding = vec2(10., 5.) * c.scale();
                 ui.spacing_mut().item_spacing = vec2(8., 8.) * c.scale();
                 ui.spacing_mut().interact_size.y = 32. * c.scale();
-                for (index, name) in [(0, "All"), (1, "Assets"), (3, "Projects"), (2, "Plugins"), (AVAILABLE_UPDATES_FILTER, "Available Updates")] {
+                for (index, name) in [(0, "All"), (1, "Assets"), (3, "Projects"), (2, "Plugins"), (CACHED_FILTER, "Cached"), (UNCACHED_FILTER, "Uncached"), (AVAILABLE_UPDATES_FILTER, "Available Updates")] {
                     let count = visible_items
                         .iter()
                         .map(|&index| &self.library.items[index])
-                        .filter(|i| self.library.matches_filter(i, index))
+                        .filter(|i| self.library_tab_matches(i, index))
                         .count();
                     let selected = self.library.filter == index;
                     let response = buttons::tab_button(ui, &theme, selected, format!("{name} ({count})"), 0.);
@@ -823,59 +1194,7 @@ impl Workspace {
                         }
                     }).response.on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Latest added uses your Fab library acquisition dates, newest first. Latest update uses listing update dates. Unavailable dates appear last.");
-                for (list, icon) in [(false, Icon::Grid), (true, Icon::List)] {
-                    let (r, response) =
-                        ui.allocate_exact_size(Vec2::splat(COMPACT_BUTTON_HEIGHT) * c.scale(), Sense::click());
-                    ui.painter().rect_filled(
-                        r,
-                        BUTTON_RADIUS,
-                        color(if self.library.list_view == list {
-                            if response.hovered() || response.is_pointer_button_down_on() {
-                                theme.accent_hover
-                            } else { theme.accent }
-                        } else if response.hovered() {
-                            SIDEBAR_HIGHLIGHT
-                        } else {
-                            theme.card
-                        }),
-                    );
-                    let local = Canvas {
-                        origin: r.min,
-                        width: 32.,
-                        height: 32.,
-                        sx: c.scale(),
-                        sy: c.scale(),
-                        theme: theme.clone(),
-                    };
-                    local.icon(
-                        ui,
-                        icon,
-                        (32. - VIEW_MODE_ICON_SIZE) / 2.,
-                        (32. - VIEW_MODE_ICON_SIZE) / 2.,
-                        VIEW_MODE_ICON_SIZE,
-                        if self.library.list_view == list {
-                            theme.on_accent
-                        } else if response.hovered() {
-                            SIDEBAR_ON_HIGHLIGHT
-                        } else {
-                            theme.muted
-                        },
-                    );
-                    ui.painter().rect_stroke(
-                        r,
-                        BUTTON_RADIUS,
-                        Stroke::new(1., color(theme.border)),
-                        StrokeKind::Inside,
-                    );
-                    if response
-                        .on_hover_text(if list { "List view" } else { "Grid view" })
-                        .clone()
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        self.library.list_view = list;
-                    }
-                }
+                library_view_toolbar::draw(ui, c, &mut self.library.list_view);
             });
             self.plugin_update_links(ui);
             if self.library.sort == Sort::LatestAdded {
@@ -892,7 +1211,7 @@ impl Workspace {
                 .map(|index| &self.library.items[index])
                 .filter(|i| {
                     self.library.search_index.get(&i.key()).and_then(|doc| query.rank(doc)).is_some()
-                        && self.library.matches_filter(i, self.library.filter)
+                        && self.library_tab_matches(i, self.library.filter)
                         && fab_listing::supports_engine(i, &self.library.engine_filter)
                 })
                 .cloned()
@@ -904,9 +1223,26 @@ impl Workspace {
             }
             self.library.footer = format!("{} items", items.len());
             let list = self.library.list_view;
-            let (columns, card_width) = card_grid_metrics(ui.available_width() - scrollbar::GRID_ALLOCATED_WIDTH, LIBRARY_CARD_WIDTH, PROJECT_CARD_GAP);
-            let thumbnail_height = (card_width - 2.) / LIBRARY_THUMBNAIL_ASPECT;
-            if !list { ui.spacing_mut().item_spacing = vec2(PROJECT_CARD_GAP, PROJECT_CARD_GAP); }
+
+            // Fixed, persisted sizes. Original preserves the upstream card geometry.
+            // Do not mutate input scroll state or vary card geometry during scrolling.
+            let chosen_size = self.prefs.library_thumbnail_size;
+            let thumbnail_size = if chosen_size == 0 { 0.0 } else { f32::from(chosen_size) };
+            let preferred_width = library_card::preferred_card_width(chosen_size, LIBRARY_CARD_WIDTH);
+            let (columns, card_width) = card_grid_metrics(
+                ui.available_width() - scrollbar::GRID_ALLOCATED_WIDTH - 2.0 * scrollbar::GRID_MARGIN - PROJECT_CARD_GAP,
+                preferred_width,
+                PROJECT_CARD_GAP,
+            );
+            let thumbnail_viewport = library_card::grid_thumbnail_viewport(
+                chosen_size, card_width, 2.0_f32, LIBRARY_THUMBNAIL_ASPECT,
+            );
+            let thumbnail_height = thumbnail_viewport.y;
+            // Virtual rows must occupy the exact height reported to show_rows.
+            // Extra vertical item spacing here can make the viewport skip rendered rows.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if !list { ui.spacing_mut().item_spacing.x = PROJECT_CARD_GAP; }
+
             AppScrollArea::vertical(&self.theme)
                 .inner_margin(scrollbar::GRID_MARGIN)
                 .id_salt((
@@ -947,6 +1283,9 @@ impl Workspace {
                                         ui.allocate_exact_size(vec2(width, height), Sense::hover());
                                     let mut card_ui = ui.new_child(UiBuilder::new().max_rect(r));
                                     let ui = &mut card_ui;
+                                    let vault_queue_position = self.library.vault_queue.iter().position(|job| job.item.key() == item.key());
+                                    let vault_is_downloading = item.project_versions.iter().any(|version|
+                                        self.library.vault_active.as_deref() == Some(version.artifact_id.as_str()));
                                     let item_updates = self.library.item_updates(item);
                                     let updates = (!item_updates.is_empty()).then_some(&item_updates);
                                     let has_update = updates.is_some_and(|u| !u.is_empty());
@@ -958,37 +1297,29 @@ impl Workspace {
                                     ui.painter().rect_stroke(
                                         r,
                                         6.,
-                                        Stroke::new(1., if has_update { update_color } else { color(theme.border) }),
+                                        Stroke::new(1_f32, if has_update { update_color } else { color(theme.border) }),
                                         StrokeKind::Inside,
                                     );
                                     let picture = if list {
                                         Rect::from_min_size(r.min + vec2(8., 8.), vec2(116., 104.))
                                     } else {
                                         Rect::from_min_size(
-                                            r.min + vec2(1., 1.),
-                                            vec2(width - 2., thumbnail_height),
+                                            r.min + vec2(if chosen_size == 0 { 1.0 } else { (width - thumbnail_size) / 2.0 }, 1.0),
+                                            vec2(if chosen_size == 0 { width - 2.0 } else { thumbnail_size }, thumbnail_height),
                                         )
                                     };
                                     let thumbnail = ui.interact(picture, ui.id().with((&key, "thumbnail")), Sense::click());
                                     let show_controls = ui.rect_contains_pointer(r) || thumbnail.has_focus()
-                                        || Popup::is_id_open(ui.ctx(), ui.id().with((&key, "folder-menu")));
+                                        || self.library.organization.is_popup_open_for(&key);
                                     let picture_corners = if list { CornerRadius::same(5) } else { thumbnail_top_corners(5.) };
                                     if let Some(tex) = self.textures.get(&key) {
-                                        let size = tex.size_vec2();
-                                        let ratio = (picture.width() / picture.height())
-                                            / (size.x / size.y);
-                                        let uv = if ratio < 1. {
-                                            Rect::from_min_max(
-                                                pos2((1. - ratio) / 2., 0.),
-                                                pos2((1. + ratio) / 2., 1.),
-                                            )
-                                        } else {
-                                            Rect::from_min_max(
-                                                pos2(0., (1. - 1. / ratio) / 2.),
-                                                pos2(1., (1. + 1. / ratio) / 2.),
-                                            )
-                                        };
-                                        paint_thumbnail(ui, tex, picture, uv, picture_corners);
+                                        // The Fab and ZIP libraries share centered, aspect-fit
+                                        // thumbnails. Keep the complete picture viewport as the
+                                        // hover/right-click target, regardless of image ratio.
+                                        library_card::paint_contained_thumbnail(
+                                            ui, tex, picture, picture_corners,
+                                            color(theme.selection),
+                                        );
                                     } else {
                                         ui.painter().rect_filled(
                                             picture,
@@ -1049,13 +1380,7 @@ impl Workspace {
                                             },
                                             if list { r.bottom() - 36. } else { y - 16. },
                                         ),
-                                        vec2(86., 30.),
-                                    );
-                                    ui.painter().rect_stroke(
-                                        badge,
-                                        5.,
-                                        Stroke::new(1., color(theme.border)),
-                                        StrokeKind::Inside,
+                                        library_card::labelled_badge_size(),
                                     );
                                     let kind = if item.plugin() {
                                         "Plugin"
@@ -1064,30 +1389,59 @@ impl Workspace {
                                     } else {
                                         "Asset"
                                     };
-                                    library_type_icon(
-                                        ui,
-                                        badge.min + vec2(10., 7.),
-                                        kind,
+                                    asset_badges::paint_labelled(
+                                        ui, badge, kind, false,
+                                        asset_badges::BadgeState::Present,
                                         color(self.cache_icon_tint(item)),
+                                        color(theme.border), color(theme.text),
                                     );
-                                    ui.painter().text(
-                                        badge.min + vec2(33., 15.),
-                                        Align2::LEFT_CENTER,
-                                        kind,
-                                        FontId::proportional(14.),
-                                        color(theme.text),
-                                    );
+
+                                    // Preserve upstream v1.3.2 cache health menu instead of
+                                    // duplicating an obsolete verifier on the type badge.
                                     let badge_response = ui.interact(badge, ui.id().with((&key,"cache-health")), Sense::click())
                                         .on_hover_ui(|ui| { ui.label(self.cached_item_tooltip(item)); });
+                                    let mut badge_hotspot_right_clicked = false;
+                                    // Legacy queue overlay remains separate from upstream cache health.
+                                    if (kind == "Asset" || kind == "Project" || kind == "Plugin") && !self.cached_item_fully_verified(item) {
+                                        let hotspot = Rect::from_min_size(pos2(badge.right()-3., badge.top()+3.), vec2(24.,24.));
+                                        let queued_paused = vault_queue_position.and_then(|i| self.library.vault_queue.get(i))
+                                            .is_some_and(|j| j.paused) || (vault_queue_position.is_some() && self.library.vault_queue_held);
+                                        let tip = if vault_is_downloading { "Pause Download" }
+                                            else if queued_paused { "Start / Resume Download" }
+                                            else if vault_queue_position.is_some() { "Cancel Download (queued)" }
+                                            else { "Download to selected Vault Cache" };
+                                        let response = ui.interact(hotspot, ui.id().with((&key,"vault-download")),Sense::click())
+                                            .on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip);
+                                        badge_hotspot_right_clicked = response.secondary_clicked();
+                                        let tint = if vault_is_downloading { Color32::from_rgb(240,188,38) }
+                                            else if queued_paused { Color32::from_rgb(72,210,100) }
+                                            else if vault_queue_position.is_some() { Color32::from_rgb(230,70,70) }
+                                            else { color(if response.hovered(){theme.accent_hover}else{theme.accent}) };
+                                        let icon = if vault_is_downloading { VaultOverlayIcon::Pause }
+                                            else if queued_paused { VaultOverlayIcon::Play }
+                                            else if vault_queue_position.is_some() { VaultOverlayIcon::Cancel }
+                                            else { VaultOverlayIcon::Download };
+                                        paint_vault_overlay_icon(ui.painter(), hotspot.center(), tint, icon);
+                                        if response.clicked() {
+                                            if vault_is_downloading { self.library.pause_active_vault(); }
+                                            else if let Some(index) = vault_queue_position {
+                                                if queued_paused { self.library.resume_vault_waiting(index); }
+                                                else { self.library.remove_vault_waiting(index); }
+                                            } else { vault_item = Some(item.clone()); }
+                                        }
+                                    }
+                                    // Attach the verification context menu after the overlapping
+                                    // download control has been registered. Right-clicking either
+                                    // the type badge or its download hotspot opens the exact same
+                                    // menu as the thumbnail, without triggering a download.
                                     let badge_menu_id = badge_response.id.with("context-menu");
-                                    let menu_preview = std::env::args().any(|a| a == "--cache-health-library-menu-preview") && item.asset_id == "item-0";
-                                    if menu_preview {
+                                    if badge_response.secondary_clicked() || badge_hotspot_right_clicked {
                                         Popup::open_id(ui.ctx(), badge_menu_id);
                                     }
+                                    let menu_preview = std::env::args().any(|a| a == "--cache-health-library-menu-preview") && item.asset_id == "item-0";
+                                    if menu_preview { Popup::open_id(ui.ctx(), badge_menu_id); }
                                     let mut badge_menu = Popup::context_menu(&badge_response).id(badge_menu_id).frame(menu_frame(&theme));
-                                    if menu_preview {
-                                        badge_menu = badge_menu.anchor(badge).align(RectAlign::TOP_START);
-                                    }
+                                    if menu_preview { badge_menu = badge_menu.anchor(badge).align(RectAlign::TOP_START); }
                                     badge_menu.show(|ui| self.library_item_options(ui, &key, &organization));
                                     if show_controls {
                                     let info = Rect::from_center_size(
@@ -1103,7 +1457,7 @@ impl Workspace {
                                     ui.painter().circle_stroke(
                                         info.center(),
                                         10.,
-                                        Stroke::new(1.6, tint),
+                                        Stroke::new(1.6_f32, tint),
                                     );
                                     ui.painter().text(
                                         info.center(),
@@ -1215,6 +1569,70 @@ impl Workspace {
             [c.width - 26., c.height - 57.],
             theme.border,
         );
+
+        if let Some(item) = vault_item {
+            if self.demo || self.session.is_none() {
+                self.notify("Sign in to download Fab assets to the Vault Cache.");
+            } else if let Some(branch) = item.supported_branches().last().cloned() {
+                if let Some(version) = item.compatible(&branch) {
+                    let root = self.prefs.default_vault_cache.clone(); // freeze destination at enqueue time
+                    if self.library.vault_active.as_ref() != Some(&version.artifact_id)
+                        && !self
+                            .library
+                            .vault_queue
+                            .iter()
+                            .any(|j| j.version.artifact_id == version.artifact_id)
+                    {
+                        self.library.vault_queue.push_back(VaultJob {
+                            item: item.clone(),
+                            version,
+                            root,
+                            mode: engine_workspace::vault_download::VaultMode::New,
+                            paused: false,
+                            chunk_cache: self.prefs.chunk_cache_root().to_owned(),
+                            stage_name: String::new(),
+                        });
+                        self.library.save_vault_queue();
+                        self.notify(format!("Queued Vault Cache download: {}", item.title));
+                    } else {
+                        self.notify("This package is already queued for Vault Cache download.");
+                    }
+                }
+            } else {
+                self.notify("No compatible Fab package version available to cache.");
+            }
+        }
+        if let Some((folder, key)) = verify_request {
+            if self.library.verify_rx.is_none() {
+                self.library
+                    .verification
+                    .insert(key.clone(), VerifyState::Checking);
+                let root = self.prefs.default_vault_cache.clone();
+                let (tx, rx) = mpsc::channel();
+                self.library.verify_rx = Some(rx);
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let result = engine_workspace::vault_scan::verify_package_integrity(
+                        Path::new(&root),
+                        &folder,
+                    );
+                    let _ = tx.send((key, result));
+                    ctx.request_repaint();
+                });
+            } else {
+                self.notify("Another Vault verification is running.");
+            }
+        }
+        if let Some(job) = replace_request {
+            if self.demo || self.session.is_none() {
+                self.notify("Sign in before re-downloading an asset.");
+            } else {
+                self.library.replace_dialog = Some(job);
+                self.library.backup_selected = false;
+                self.library.backup_folder.clear();
+            }
+        }
+
         if let Some(item) = update_item {
             let pending = self
                 .library
@@ -1282,8 +1700,149 @@ impl Workspace {
         } else {
             self.library_install_dialog(ui.ctx());
         }
+        self.library_folder_popup_overlay(ui.ctx());
         self.library_folder_dialog(ui.ctx());
+        self.vault_replace_dialog(ui.ctx());
     }
+
+    /// Offer the legacy safe replacement only for an unambiguous, failed upstream
+    /// cache-health record. Ambiguous package versions must not be guessed.
+    pub(super) fn request_failed_vault_replacement(&mut self, item: Item) {
+        use engine_workspace::vault_health::Health;
+        let failed: Vec<_> = self
+            .cache_health
+            .for_item(&item)
+            .into_iter()
+            .filter(|record| record.health == Health::Redownload)
+            .collect();
+        if failed.len() != 1 || item.project_versions.len() != 1 {
+            self.notify("Re-download requires exactly one failed cached package and one identifiable Fab package version.");
+            return;
+        }
+        let path = &failed[0].path;
+        let (Some(root), Some(folder)) = (path.parent(), path.file_name()) else {
+            self.notify("Cannot determine the cached package location for replacement.");
+            return;
+        };
+        if !path.is_dir() || !path.join("manifest").is_file() || !path.join("data").is_dir() {
+            self.notify("The damaged cache entry does not have a recognizable manifest/data package layout.");
+            return;
+        }
+        let root = root.to_string_lossy().into_owned();
+        let folder = folder.to_string_lossy().into_owned();
+        if self.library.vault_in_progress.is_some()
+            || self
+                .library
+                .vault_queue
+                .iter()
+                .any(|job| job.version.artifact_id == item.project_versions[0].artifact_id)
+        {
+            self.notify("This asset already has a Vault download in progress or queued.");
+            return;
+        }
+        self.library.replace_dialog = Some(VaultJob {
+            version: item.project_versions[0].clone(),
+            item,
+            root,
+            mode: engine_workspace::vault_download::VaultMode::Replace {
+                folder,
+                backup_directory: None,
+            },
+            paused: false,
+            chunk_cache: self.prefs.chunk_cache_root().to_owned(),
+            stage_name: String::new(),
+        });
+        self.library.backup_selected = false;
+        self.library.backup_folder.clear();
+    }
+
+    fn vault_replace_dialog(&mut self, ctx: &Context) {
+        let Some(job) = self.library.replace_dialog.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        dialog::show(
+            ctx,
+            &self.theme.clone(),
+            "vault-replace",
+            "Re-download Asset",
+            "Download and validate a replacement before changing the existing Vault package.",
+            &mut open,
+            |ui| {
+                ui.label(RichText::new(&job.item.title).strong());
+                ui.checkbox(&mut self.library.backup_selected, "Back up existing asset");
+                if self.library.backup_selected {
+                    ui.horizontal(|ui| {
+                        ui.label(if self.library.backup_folder.is_empty() {
+                            "Choose backup folder"
+                        } else {
+                            &self.library.backup_folder
+                        });
+                        if ui.button("Browse...").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new()
+                                .set_title("Select asset backup folder")
+                                .pick_folder()
+                            {
+                                self.library.backup_folder = folder.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.label("Assets queued during the same minute share a timestamped UnrealAssetBackup folder.");
+                } else {
+                    ui.label("Replace existing: the old package is temporarily retained for rollback, then deleted only after successful publication.");
+                }
+                let valid = !self.library.backup_selected
+                    || Path::new(&self.library.backup_folder).is_dir();
+                if ui
+                    .add_enabled(valid, buttons::secondary_button("Queue Re-download Asset"))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            },
+        );
+        if !open || cancelled {
+            self.library.replace_dialog = None;
+        }
+        if confirmed {
+            let backup_directory = if self.library.backup_selected {
+                Some(Path::new(&self.library.backup_folder).join(vault_backup_folder_name()))
+            } else {
+                None
+            };
+            let mut job = job;
+            let folder = match &job.mode {
+                engine_workspace::vault_download::VaultMode::Replace { folder, .. } => {
+                    folder.clone()
+                }
+                _ => unreachable!(),
+            };
+            job.mode = engine_workspace::vault_download::VaultMode::Replace {
+                folder,
+                backup_directory,
+            };
+            if self.library.vault_active.as_ref() == Some(&job.version.artifact_id)
+                || self
+                    .library
+                    .vault_queue
+                    .iter()
+                    .any(|queued| queued.version.artifact_id == job.version.artifact_id)
+            {
+                self.notify("This asset is already being downloaded.");
+            } else {
+                self.notify(format!("Queued re-download: {}", job.item.title));
+                self.library.vault_queue.push_back(job);
+                self.library.save_vault_queue();
+            }
+            self.library.replace_dialog = None;
+        }
+    }
+
     fn start_next_library_install(&mut self, ctx: &Context) {
         let ready = !self.demo
             && self.session.is_some()
@@ -1293,6 +1852,74 @@ impl Workspace {
             && !self.transfer.busy()
             && !self.plugin_work.busy()
             && !self.launcher_updates.blocks_work();
+
+        if ready {
+            if !self.library.vault_queue_held {
+                if let Some(pos) = self.library.vault_queue.iter().position(|job| !job.paused) {
+                    if let Some(mut job) = self.library.vault_queue.remove(pos) {
+                        if job.stage_name.is_empty() {
+                            job.stage_name = engine_workspace::vault_download::stage_name(
+                                &job.version.artifact_id,
+                            );
+                        }
+                        self.library.vault_in_progress = Some(job.clone());
+                        self.library.vault_progress = None;
+                        self.library.vault_pause_requested = false;
+                        self.library.vault_cancel_requested = false;
+                        self.library.save_vault_queue();
+                        let VaultJob {
+                            item,
+                            version,
+                            root,
+                            mode,
+                            paused: _,
+                            chunk_cache: _,
+                            stage_name,
+                        } = job;
+                        let session = self.session.clone().expect("Vault queue requires session");
+                        self.library.vault_active = Some(version.artifact_id.clone());
+                        self.library.installing = true;
+                        self.library.install_item = format!("Vault Cache download: {}", item.title);
+                        self.library.install_engine = root.clone();
+                        self.library.status = "Preparing Vault Cache transfer...".into();
+                        let control = engine_workspace::installer::Control::default();
+                        self.library.install_control = Some(control.clone());
+                        let (tx, rx) = mpsc::channel();
+                        self.library.rx = Some(rx);
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            let published_folder = match &mode {
+                                engine_workspace::vault_download::VaultMode::New => {
+                                    version.artifact_id.clone()
+                                }
+                                engine_workspace::vault_download::VaultMode::Replace {
+                                    folder,
+                                    ..
+                                } => folder.clone(),
+                            };
+                            let result =
+                                engine_workspace::vault_download::download_with_mode_staged(
+                                    &session,
+                                    &item,
+                                    &version,
+                                    Path::new(&root),
+                                    &control,
+                                    mode,
+                                    Some(&stage_name),
+                                    |message| {
+                                        let _ = tx.send(Event::Status(message));
+                                        crate::window_frame::progress_repaint(&ctx);
+                                    },
+                                );
+                            let _ = tx.send(Event::VaultFinished(result, published_folder));
+                            ctx.request_repaint();
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+
         let Some(job) = self.library.install_queue.start_next(ready) else {
             return;
         };
@@ -1412,7 +2039,7 @@ impl Workspace {
             |ui| {
                 Frame::new()
                     .fill(color(self.theme.card))
-                    .stroke(Stroke::new(1., color(self.theme.border)))
+                    .stroke(Stroke::new(1_f32, color(self.theme.border)))
                     .corner_radius(5.)
                     .inner_margin(8)
                     .show(ui, |ui| {
@@ -1475,7 +2102,7 @@ impl Workspace {
                             buttons::secondary_button("No compatible engines installed")
                                 .min_size(vec2(ui.available_width(), 44.)),
                         );
-                        Frame::new().fill(color(self.theme.card)).stroke(Stroke::new(1.,color(self.theme.warning))).corner_radius(6.).inner_margin(16).show(ui,|ui|{
+                        Frame::new().fill(color(self.theme.card)).stroke(Stroke::new(1_f32,color(self.theme.warning))).corner_radius(6.).inner_margin(16).show(ui,|ui|{
                             ui.set_width(ui.available_width());
                             ui.horizontal_top(|ui|{
                                 let(r,_)=ui.allocate_exact_size(vec2(34.,34.),Sense::hover());
@@ -1574,7 +2201,7 @@ impl Workspace {
                             let(r,response)=ui.allocate_exact_size(vec2(width,150.),if selectable { Sense::click() } else { Sense::hover() });
                             let selected=selectable && self.library.target==index;
                             ui.painter().rect_filled(r,5.,color(self.theme.card));
-                            ui.painter().rect_stroke(r,5.,Stroke::new(if selected{2.}else{1.},color(if selected{self.theme.accent}else{self.theme.border})),StrokeKind::Inside);
+                            ui.painter().rect_stroke(r,5.,Stroke::new(if selected{2_f32}else{1_f32},color(if selected{self.theme.accent}else{self.theme.border})),StrokeKind::Inside);
                             let picture=Rect::from_min_max(r.min+vec2(2.,2.),pos2(r.right()-2.,r.bottom()-32.));
                             let artwork=self.projects.iter().find(|p|Path::new(&p.path).parent().is_some_and(|d|d==Path::new(path))).and_then(|p|p.artwork.as_ref()).and_then(|a|self.textures.get(a));
                             if let Some(tex)=artwork{paint_thumbnail(ui,tex,picture,Rect::from_min_max(Pos2::ZERO,pos2(1.,1.)),thumbnail_top_corners(3.));}
@@ -1750,7 +2377,7 @@ fn engine_install_row(
     Frame::new()
         .fill(color(theme.card))
         .stroke(Stroke::new(
-            1.,
+            1_f32,
             color(if *selected {
                 theme.accent
             } else {
@@ -1796,7 +2423,7 @@ fn library_action_label(
     failed: bool,
 ) -> &'static str {
     if checking {
-        "Checking package…"
+        "Checking…"
     } else if failed {
         "Check package"
     } else if updating {
@@ -1812,47 +2439,26 @@ fn library_action_label(
     }
 }
 fn library_type_icon(ui: &Ui, origin: Pos2, kind: &str, tint: Color32) {
-    let p = ui.painter();
-    let s = Stroke::new(1.4, tint);
-    let line = |a: [f32; 2], b: [f32; 2]| {
-        p.line_segment([origin + vec2(a[0], a[1]), origin + vec2(b[0], b[1])], s);
-    };
-    if kind == "Asset" {
-        for (a, b) in [
-            ([0., 4.], [7., 0.]),
-            ([7., 0.], [14., 4.]),
-            ([14., 4.], [14., 12.]),
-            ([14., 12.], [7., 16.]),
-            ([7., 16.], [0., 12.]),
-            ([0., 12.], [0., 4.]),
-            ([0., 4.], [7., 8.]),
-            ([7., 8.], [14., 4.]),
-            ([7., 8.], [7., 16.]),
-        ] {
-            line(a, b);
-        }
-    } else if kind == "Project" {
-        for (a, b) in [
-            ([0., 3.], [6., 3.]),
-            ([6., 3.], [8., 6.]),
-            ([8., 6.], [15., 6.]),
-            ([15., 6.], [15., 15.]),
-            ([15., 15.], [0., 15.]),
-            ([0., 15.], [0., 3.]),
-        ] {
-            line(a, b);
-        }
+    // Keep original cache-health semantics; only the type glyph artwork changes.
+    let state = if tint == Color32::from_rgb(37, 117, 71) {
+        asset_badges::BadgeState::Present
+    } else if tint == Color32::from_rgb(55, 150, 245) {
+        asset_badges::BadgeState::Checking
     } else {
-        p.rect_stroke(
-            Rect::from_min_size(origin + vec2(2., 5.), vec2(11., 10.)),
-            1.,
-            s,
-            StrokeKind::Inside,
-        );
-        p.circle_stroke(origin + vec2(7.5, 3.), 2.5, s);
-        p.circle_stroke(origin + vec2(15., 10.), 2.5, s);
-    }
+        // Existing source owns verification status and its tint; this fallback
+        // intentionally does not infer SHA verification from arbitrary colours.
+        asset_badges::BadgeState::Present
+    };
+    asset_badges::paint_tinted(
+        ui.painter(),
+        Rect::from_min_size(origin, vec2(19., 19.)),
+        kind,
+        false,
+        state,
+        tint,
+    );
 }
+
 impl Workspace {
     fn library_create_dialog(&mut self, ctx: &Context) {
         let Some(item) = self.library.selected.clone() else {
@@ -2027,7 +2633,7 @@ mod update_state_tests {
         );
         assert_eq!(
             library_action_label(&city, false, false, true, false),
-            "Checking package…"
+            "Checking…"
         );
         assert_eq!(
             library_action_label(&city, false, false, false, true),
@@ -2362,5 +2968,103 @@ impl Workspace {
         self.library.installing = false;
         self.library.install_control = None;
         self.library.install_queue = Default::default();
+    }
+}
+
+/// Local, minute-precision backup group name. Windows uses its native local clock;
+/// non-Windows development builds use UTC without changing Cargo dependencies.
+fn vault_backup_folder_name() -> String {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct SystemTime {
+            wYear: u16,
+            wMonth: u16,
+            wDayOfWeek: u16,
+            wDay: u16,
+            wHour: u16,
+            wMinute: u16,
+            wSecond: u16,
+            wMilliseconds: u16,
+        }
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            fn GetLocalTime(lpSystemTime: *mut SystemTime);
+        }
+        let mut local = SystemTime {
+            wYear: 0,
+            wMonth: 0,
+            wDayOfWeek: 0,
+            wDay: 0,
+            wHour: 0,
+            wMinute: 0,
+            wSecond: 0,
+            wMilliseconds: 0,
+        };
+        unsafe {
+            GetLocalTime(&mut local);
+        }
+        return format!(
+            "UnrealAssetBackup_{:04}{:02}{:02}_{:02}{:02}",
+            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let utc = time::OffsetDateTime::now_utc();
+        format!(
+            "UnrealAssetBackup_{:04}{:02}{:02}_{:02}{:02}",
+            utc.year(),
+            u8::from(utc.month()),
+            utc.day(),
+            utc.hour(),
+            utc.minute()
+        )
+    }
+}
+
+// Render Vault transfer controls as vector geometry instead of font glyphs.
+// All four icons use the same 24-point transparent interaction region.
+#[derive(Clone, Copy)]
+enum VaultOverlayIcon {
+    Download,
+    Cancel,
+    Pause,
+    Play,
+}
+
+fn paint_vault_overlay_icon(
+    painter: &egui::Painter,
+    center: Pos2,
+    tint: Color32,
+    icon: VaultOverlayIcon,
+) {
+    let at = |x: f32, y: f32| pos2(center.x + x, center.y + y);
+    let stroke = Stroke::new(2.2_f32, tint);
+    match icon {
+        VaultOverlayIcon::Download => {
+            painter.line_segment([at(0.0, -8.0), at(0.0, 3.0)], stroke);
+            painter.line_segment([at(-5.0, -1.0), at(0.0, 4.0)], stroke);
+            painter.line_segment([at(0.0, 4.0), at(5.0, -1.0)], stroke);
+            painter.line_segment([at(-7.0, 6.0), at(-7.0, 9.0)], stroke);
+            painter.line_segment([at(-7.0, 9.0), at(7.0, 9.0)], stroke);
+            painter.line_segment([at(7.0, 9.0), at(7.0, 6.0)], stroke);
+        }
+        VaultOverlayIcon::Cancel => {
+            painter.line_segment([at(-6.0, -6.0), at(6.0, 6.0)], stroke);
+            painter.line_segment([at(6.0, -6.0), at(-6.0, 6.0)], stroke);
+        }
+        VaultOverlayIcon::Pause => {
+            painter.line_segment([at(-4.0, -7.0), at(-4.0, 7.0)], Stroke::new(3.0_f32, tint));
+            painter.line_segment([at(4.0, -7.0), at(4.0, 7.0)], Stroke::new(3.0_f32, tint));
+        }
+        VaultOverlayIcon::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![at(-5.0, -8.0), at(8.0, 0.0), at(-5.0, 8.0)],
+                tint,
+                Stroke::NONE,
+            ));
+        }
     }
 }

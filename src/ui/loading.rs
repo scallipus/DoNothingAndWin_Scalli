@@ -33,7 +33,7 @@ impl Widget for Loader {
                 })
                 .collect();
             ui.painter()
-                .add(Shape::line(points, Stroke::new(3., self.color)));
+                .add(Shape::line(points, Stroke::new(3_f32, self.color)));
         }
         response
     }

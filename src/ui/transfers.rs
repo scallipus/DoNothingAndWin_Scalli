@@ -19,6 +19,8 @@ pub(super) struct Transfers {
     pub parent: String,
     pub modal: bool,
     pub shortcut: bool,
+    pub cache_engine_files: bool,
+    pub confirm_delete_cached_engine: bool,
     pub component_options: Option<super::engine_options::Options>,
     pub state: String,
     pub activity: super::plugin_activity::Activity,
@@ -267,6 +269,7 @@ impl Workspace {
         self.transfer.parent = self.prefs.install_root.clone();
         self.transfer.modal = true;
         self.transfer.shortcut = true;
+        self.transfer.cache_engine_files = false;
         self.transfer.component_options = None;
         self.transfer.state.clear();
         self.prepare_install(ctx);
@@ -299,7 +302,7 @@ impl Workspace {
             ctx.request_repaint();
         });
     }
-    fn run_install(&mut self, ctx: Context) {
+    fn run_install(&mut self, ctx: Context, from_cache: bool) {
         if self.transfer.busy() || self.plugin_work.mutating {
             return;
         }
@@ -320,6 +323,22 @@ impl Workspace {
             self.notify("This engine version is already installed.");
             return;
         }
+        let cache_root = self
+            .transfer
+            .cache_engine_files
+            .then(|| PathBuf::from(&self.prefs.default_vault_cache));
+        if let Some(root) = cache_root.as_ref() {
+            if self.prefs.default_vault_cache.trim().is_empty() {
+                self.notify("Set a Vault Cache folder in Settings before enabling engine caching.");
+                return;
+            }
+            let folder =
+                engine_workspace::engine_cache::build_folder(root, &plan.manifest, &plan.selected);
+            if folder.join("complete.json").is_file() && !from_cache {
+                self.notify(format!("Download blocked: exact engine build is already cached at {}. Choose Install from Cache or explicitly delete that cached build.",folder.display()));
+                return;
+            }
+        }
         let Some(worker) = self.transfer.operation.install() else {
             return;
         };
@@ -332,7 +351,15 @@ impl Workspace {
         self.transfer.state = "Preparing download…".into();
         self.page = Page::Downloads;
         std::thread::spawn(move || {
-            let result = installer::install(&plan, &control, progress);
+            let result = if let Some(root) = cache_root.as_ref() {
+                if from_cache {
+                    installer::install_from_engine_cache(&plan, &control, progress, root)
+                } else {
+                    installer::install_with_engine_cache(&plan, &control, progress, root)
+                }
+            } else {
+                installer::install(&plan, &control, progress)
+            };
             let _ = tx.send(Event::Finished(result));
             ctx.request_repaint();
         });
@@ -666,6 +693,8 @@ impl Workspace {
         let mut prepare = false;
         let mut install = false;
         let mut options = false;
+        let mut install_cached = false;
+        let mut delete_cached = false;
         dialog::show(
             ctx,
             &self.theme.clone(),
@@ -725,6 +754,50 @@ impl Workspace {
                         .clicked();
                 }
                 ui.add(buttons::checkbox(
+                    &mut self.transfer.cache_engine_files,
+                    "Cache Engine Files in Vault Cache\\.EngineCache",
+                    &self.theme,
+                ));
+                if self.transfer.cache_engine_files {
+                    ui.label(format!("Cache root: {}", self.prefs.default_vault_cache));
+                    ui.small("Preserves verified chunks for this exact build and selected components. Completed builds are never overwritten.");
+                }
+                if self.transfer.cache_engine_files {
+                    if let Some(plan) = self.transfer.operation.plan() {
+                        let root = PathBuf::from(&self.prefs.default_vault_cache);
+                        if !self.prefs.default_vault_cache.trim().is_empty() {
+                            let folder = engine_workspace::engine_cache::build_folder(
+                                &root,
+                                &plan.manifest,
+                                &plan.selected,
+                            );
+                            if folder.join("complete.json").is_file() {
+                                ui.separator();
+                                ui.label("Download blocked: exact engine build already cached.");
+                                ui.label(format!("Location: {}", folder.display()));
+                                if ui.button("Install from Cache (no Epic download)").clicked() {
+                                    install_cached = true;
+                                }
+                                if !self.transfer.confirm_delete_cached_engine {
+                                    if ui.button("Delete this cached build…").clicked() {
+                                        self.transfer.confirm_delete_cached_engine = true;
+                                    }
+                                } else {
+                                    ui.label("Confirm deletion of the cached build above. This does not delete installed engines.");
+                                    if ui.button("Confirm delete cached build").clicked() {
+                                        delete_cached = true;
+                                    }
+                                    if ui.button("Keep cached build").clicked() {
+                                        self.transfer.confirm_delete_cached_engine = false;
+                                    }
+                                }
+                            } else {
+                                self.transfer.confirm_delete_cached_engine = false;
+                            }
+                        }
+                    }
+                }
+                ui.add(buttons::checkbox(
                     &mut self.transfer.shortcut,
                     "Create desktop shortcut",
                     &self.theme,
@@ -756,10 +829,31 @@ impl Workspace {
                 );
             }
         }
+        if delete_cached {
+            if let Some(plan) = self.transfer.operation.plan() {
+                let root = PathBuf::from(&self.prefs.default_vault_cache);
+                let folder = engine_workspace::engine_cache::build_folder(
+                    &root,
+                    &plan.manifest,
+                    &plan.selected,
+                );
+                let result = engine_workspace::engine_cache::delete_build(&folder, &root);
+                self.transfer.confirm_delete_cached_engine = false;
+                match result {
+                    Ok(()) => self.notify(format!("Deleted only the cached engine build at {}. You may now download it again.", folder.display())),
+                    Err(e) => self.notify(format!("Cached build not deleted: {e}")),
+                }
+            }
+        }
+        if install_cached {
+            self.prefs.install_root = self.transfer.parent.clone();
+            self.persist();
+            self.run_install(ctx.clone(), true);
+        }
         if install {
             self.prefs.install_root = self.transfer.parent.clone();
             self.persist();
-            self.run_install(ctx.clone());
+            self.run_install(ctx.clone(), false);
         }
     }
 }

@@ -2,6 +2,74 @@ use super::*;
 use engine_workspace::vault_health::{self as health, Gate, Health, Record, Report, Selection};
 use std::path::PathBuf;
 
+struct QuickEntry {
+    root: PathBuf,
+    path: PathBuf,
+    title: String,
+    identities: Vec<String>,
+    fingerprints: engine_workspace::vault_fingerprint::Fingerprints,
+}
+/// Background-only, bounded manifest reads and top-level directory names.
+fn reconcile_startup(
+    roots: &[String],
+    known: &std::collections::HashSet<String>,
+) -> Vec<QuickEntry> {
+    let mut pending = Vec::<(bool, PathBuf, PathBuf)>::new();
+    for root in roots {
+        let request = Path::new(root);
+        let Ok(root) = std::fs::canonicalize(request) else {
+            continue;
+        };
+        let Ok(list) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in list.flatten() {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .is_ok_and(|t| t.is_dir() && !t.is_symlink())
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".engine-workspace-")
+                || name == "EngineWorkspace"
+                || name == "FabLibrary"
+            {
+                continue;
+            }
+            pending.push((!known.contains(&health::key(&path)), root.clone(), path));
+        }
+    }
+    // New packages first; stable order avoids starvation and unrelated package traversals.
+    pending.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+    let mut found = Vec::new();
+    for (_is_new, root, path) in pending {
+        let Ok(fingerprints) = engine_workspace::vault_fingerprint::capture(&path, false) else {
+            continue;
+        };
+        let manifest = path.join("manifest");
+        let identities = std::fs::metadata(&manifest)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= 64 * 1024 * 1024)
+            .and_then(|_| std::fs::read(&manifest).ok())
+            .and_then(|raw| engine_workspace::buildpatch::parse(&raw).ok())
+            .map(|m| vec![m.app])
+            .unwrap_or_default();
+        found.push(QuickEntry {
+            root,
+            title: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path,
+            identities,
+            fingerprints,
+        });
+    }
+    found
+}
 enum Event {
     Progress(String),
     Finished(Result<Vec<Record>, String>),
@@ -18,18 +86,22 @@ fn current_result(
 }
 #[derive(Default)]
 pub(super) struct State {
-    report: Report,
+    pub(super) report: Report,
     roots: Vec<String>,
     rx: Option<Receiver<Event>>,
+    startup_quick_rx: Option<Receiver<(Vec<String>, Vec<QuickEntry>)>>,
+    startup_quick_finished: bool,
     gate: Option<Gate>,
     startup_checked: bool,
     automatic: bool,
     selection: Option<Selection>,
     pending_manual: Option<Selection>,
+    queued_manual: std::collections::VecDeque<Selection>,
     pub status: String,
     progress: health::Progress,
     pause_reason: String,
     details_open: bool,
+    validation_log_open: bool,
     paused: bool,
     retry_after_work: bool,
     item_records: HashMap<String, Vec<String>>,
@@ -91,6 +163,7 @@ impl State {
     pub fn cancel(&mut self) {
         self.retry_after_work = false;
         self.pending_manual = None;
+        self.queued_manual.clear();
         if let Some(gate) = &self.gate {
             gate.cancel();
         }
@@ -101,16 +174,55 @@ impl State {
         self.pending_manual = Some(selection);
         self.status = "Selected verification queued; waiting for the current check to stop.".into();
     }
+    fn queue_manual(&mut self, selection: Selection) {
+        // Never cancel a running verification just because another asset was selected.
+        // Retain the first pending request and append further requests in FIFO order.
+        let target = selection_title(&selection);
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|active| selection_title(active) == target)
+            || self
+                .pending_manual
+                .as_ref()
+                .is_some_and(|pending| selection_title(pending) == target)
+            || self
+                .queued_manual
+                .iter()
+                .any(|queued| selection_title(queued) == target)
+        {
+            return;
+        }
+        if self.pending_manual.is_none() {
+            self.pending_manual = Some(selection);
+        } else {
+            self.queued_manual.push_back(selection);
+        }
+        self.status = format!(
+            "Verification queued · {} waiting",
+            self.queued_manual.len() + usize::from(self.pending_manual.is_some())
+        );
+    }
     fn take_pending_manual(&mut self, work_busy: bool) -> Option<Selection> {
         if self.rx.is_some() || work_busy {
             return None;
         }
         let selection = self.pending_manual.take()?;
+        self.pending_manual = self.queued_manual.pop_front();
         self.retry_after_work = false;
         Some(selection)
     }
-    fn heading(&self) -> String {
-        let state = if self.pending_manual.is_some() {
+    pub(super) fn heading(&self) -> String {
+        let state = if self.rx.is_some()
+            && self.gate.as_ref().is_some_and(Gate::cancelled)
+            && !self.retry_after_work
+        {
+            "Stopping"
+        } else if self.rx.is_some() && (self.paused || self.retry_after_work) {
+            "Paused"
+        } else if self.rx.is_some() {
+            "Checking"
+        } else if self.pending_manual.is_some() {
             "Queued"
         } else if !self.busy() {
             if self.status == "Cache verification stopped." {
@@ -137,17 +249,23 @@ impl State {
         };
         format!("Cache verification · {state} · {item}")
     }
-    fn detail(&self) -> String {
+    pub(super) fn detail(&self) -> String {
         if !self.busy() {
             return self.status.clone();
         }
         if let Some(next) = &self.pending_manual {
-            let reason = if !self.paused && !self.retry_after_work {
-                "Stopping the previous verification"
+            let waiting = 1 + self.queued_manual.len();
+            let reason = if self.rx.is_some() && !self.paused && !self.retry_after_work {
+                "Waiting for the active verification to finish"
+            } else if self.paused || self.retry_after_work {
+                self.pause_reason.as_str()
             } else {
-                &self.pause_reason
+                "Waiting for the verification worker"
             };
-            return format!("Next: {} · {reason}", selection_title(next));
+            return format!(
+                "Next: {} · {waiting} queued · {reason}",
+                selection_title(next)
+            );
         }
         if self.gate.as_ref().is_some_and(Gate::cancelled) && !self.retry_after_work {
             return "Stopping the file reader…".into();
@@ -165,6 +283,9 @@ impl State {
             "{count} · {} / {} folders inspected",
             p.entries_completed, p.entries_total
         )
+    }
+    pub(super) fn ticker_progress(&self) -> Option<f32> {
+        (self.progress.files_total > 0).then(|| self.fraction())
     }
     fn fraction(&self) -> f32 {
         let p = &self.progress;
@@ -223,7 +344,7 @@ impl State {
         }
         self.item_records = links;
     }
-    fn for_item(&self, item: &engine_workspace::fab::Item) -> Vec<&Record> {
+    pub(super) fn for_item(&self, item: &engine_workspace::fab::Item) -> Vec<&Record> {
         self.item_records
             .get(&item.key())
             .into_iter()
@@ -288,6 +409,7 @@ mod tests {
                     detail: "Verified before download".into(),
                     checked_at: 42,
                     files: 5,
+                    fingerprints: None,
                 },
             );
         }
@@ -384,6 +506,27 @@ mod tests {
         assert!(!state.busy());
     }
     #[test]
+    fn manual_requests_queue_without_cancelling_active_verification() {
+        let mut state = State::default();
+        let gate = Gate::default();
+        let (_tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        state.gate = Some(gate.clone());
+        state.selection = Some(Selection::Entry("C:/Cache/Active".into()));
+        state.queue_manual(Selection::Entry("C:/Cache/First".into()));
+        state.queue_manual(Selection::Entry("C:/Cache/Second".into()));
+        assert!(!gate.cancelled());
+        assert_eq!(state.queued_manual.len(), 1);
+        assert!(state.take_pending_manual(false).is_none());
+        state.rx = None;
+        assert!(
+            matches!(state.take_pending_manual(false), Some(Selection::Entry(path)) if path == Path::new("C:/Cache/First"))
+        );
+        assert!(
+            matches!(state.take_pending_manual(false), Some(Selection::Entry(path)) if path == Path::new("C:/Cache/Second"))
+        );
+    }
+    #[test]
     fn stop_clears_a_pending_manual_check_without_losing_operation_retries() {
         let mut state = State::default();
         state.retry_after_work = true;
@@ -423,6 +566,7 @@ mod tests {
             detail: "Verified".into(),
             checked_at: 1,
             files: 1,
+            fingerprints: None,
         };
         state
             .report
@@ -485,9 +629,13 @@ impl Workspace {
         if self.demo || std::env::args().any(|a| a.starts_with("--layout-probe=")) {
             return;
         }
-        if self.cache_health.busy() {
+        // A queued successor must not count as an active worker. The scheduler
+        // keeps the following request in `pending_manual` when handing us the
+        // current one; `busy()` includes that pending request, so testing it
+        // here would requeue the current job indefinitely when 2+ await it.
+        if self.cache_health.rx.is_some() || self.cache_health.retry_after_work {
             if !automatic {
-                self.cache_health.prioritize(selection);
+                self.cache_health.queue_manual(selection);
                 ctx.request_repaint();
             }
             return;
@@ -512,10 +660,22 @@ impl Workspace {
             self.session.clone()
         };
         let items = self.library.cache_items().to_vec();
+        // A previously identified package can be verified directly. Fall back to
+        // the catalogue search if its manifest no longer identifies this item.
+        let known = if let Selection::Item(item) = &selection {
+            let matches = self.cache_health.for_item(item);
+            if matches.len() == 1 {
+                Some(matches[0].path.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let mut last = Instant::now() - Duration::from_secs(1);
-            let progress = |path: &Path| {
+            let mut progress = |path: &Path| {
                 if last.elapsed() >= Duration::from_millis(500) {
                     let _ = tx.send(Event::Progress(path.display().to_string()));
                     ctx.request_repaint();
@@ -523,11 +683,75 @@ impl Workspace {
                 }
             };
             let result = if let Some(session) = session {
-                health::verify_roots_with_catalog(
-                    &roots, &selection, &gate, progress, &session, &items,
-                )
+                if let (Selection::Item(item), Some(path)) = (&selection, known.as_ref()) {
+                    // Verify the known package itself first. Its trusted manifest
+                    // must still identify the requested Fab item. If not, search.
+                    let direct = health::verify_roots_with_catalog(
+                        &roots,
+                        &Selection::Entry(path.clone()),
+                        &gate,
+                        &mut progress,
+                        &session,
+                        &items,
+                    );
+                    match direct {
+                        Ok(records)
+                            if records.len() == 1
+                                && records.iter().any(|record| {
+                                    let entry = engine_workspace::vault_cache::Entry {
+                                        root: record.root.clone(),
+                                        path: record.path.clone(),
+                                        title: record.title.clone(),
+                                        bytes: 0,
+                                        identities: record.identities.clone(),
+                                        removable: false,
+                                        incomplete: false,
+                                    };
+                                    !record.identities.is_empty()
+                                        && engine_workspace::vault_cache::match_item(
+                                            &entry,
+                                            std::slice::from_ref(item),
+                                        )
+                                        .is_some()
+                                }) =>
+                        {
+                            Ok(records)
+                        }
+                        Ok(_) => health::verify_roots_with_catalog(
+                            &roots,
+                            &selection,
+                            &gate,
+                            &mut progress,
+                            &session,
+                            &items,
+                        ),
+                        Err(error) if !gate.cancelled() => {
+                            let _ = tx.send(Event::Progress(format!(
+                                "Known package unavailable ({error}); searching configured caches"
+                            )));
+                            health::verify_roots_with_catalog(
+                                &roots,
+                                &selection,
+                                &gate,
+                                &mut progress,
+                                &session,
+                                &items,
+                            )
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    health::verify_roots_with_catalog(
+                        &roots,
+                        &selection,
+                        &gate,
+                        &mut progress,
+                        &session,
+                        &items,
+                    )
+                }
             } else {
-                health::verify_roots(&roots, &selection, &gate, progress)
+                health::verify_roots(&roots, &selection, &gate, &mut progress)
             };
             let _ = tx.send(Event::Finished(result));
             ctx.request_repaint();
@@ -543,7 +767,72 @@ impl Workspace {
             if !self.cache_health.busy() {
                 self.cache_health.roots = roots.clone();
                 self.cache_health.startup_checked = false;
+                self.cache_health.startup_quick_finished = false;
                 self.rebuild_cache_health_links();
+            }
+        }
+        // The structural scan is intentionally independent of SHA-1 verification.
+        // It starts immediately after preferences load, never on the UI thread.
+        if self.cache_health.startup_quick_rx.is_none() && !self.cache_health.startup_quick_finished
+        {
+            let (tx, rx) = mpsc::channel();
+            let known = self.cache_health.report.records.keys().cloned().collect();
+            let configured = roots.clone();
+            let ctx = ctx.clone();
+            self.cache_health.startup_quick_rx = Some(rx);
+            std::thread::spawn(move || {
+                let scanned = reconcile_startup(&configured, &known);
+                let _ = tx.send((configured, scanned));
+                ctx.request_repaint();
+            });
+        }
+        if let Some(rx) = &self.cache_health.startup_quick_rx {
+            match rx.try_recv() {
+                Ok((checked_roots, packages)) => {
+                    self.cache_health.startup_quick_rx = None;
+                    if checked_roots == roots {
+                        for found in packages {
+                            let key = health::key(&found.path);
+                            if let Some(record) = self.cache_health.report.records.get_mut(&key) {
+                                let matches = record.fingerprints.as_ref().is_none_or(|old| {
+                                    old.schema == found.fingerprints.schema
+                                        && old.quick == found.fingerprints.quick
+                                });
+                                if !matches {
+                                    record.health = Health::Unknown;
+                                    record.detail = "Cached package structure changed; a new SHA-1 verification is needed.".into();
+                                }
+                                let mut fresh = found.fingerprints;
+                                if matches {
+                                    fresh.full_tree = record
+                                        .fingerprints
+                                        .as_ref()
+                                        .and_then(|old| old.full_tree.clone());
+                                }
+                                record.fingerprints = Some(fresh);
+                                if !found.identities.is_empty() {
+                                    record.identities = found.identities;
+                                }
+                            } else {
+                                self.cache_health.report.records.insert(key, Record {
+                                    root: found.root, path: found.path, title: found.title,
+                                    identities: found.identities,
+                                    health: Health::Unknown,
+                                    detail: "Vault package detected; contents have not passed SHA-1 validation.".into(),
+                                    checked_at: 0, files: 0, fingerprints: Some(found.fingerprints),
+                                });
+                            }
+                        }
+                        health::save(&self.cache_health.report);
+                        self.rebuild_cache_health_links();
+                        self.cache_health.startup_quick_finished = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.cache_health.startup_quick_rx = None;
+                    self.cache_health.startup_quick_finished = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         let transfer_busy = self.transfer.busy()
@@ -645,11 +934,43 @@ impl Workspace {
                                 self.cache_health.report.finished_all_at = epic::now();
                                 self.cache_health.report.roots = roots.clone();
                             }
+                            let manual = !self.cache_health.automatic;
+                            let mut report_invalid = false;
+                            if manual {
+                                for record in &records {
+                                    let outcome = match record.health {
+                                        Health::Healthy => "VALID",
+                                        Health::Redownload => {
+                                            report_invalid = true;
+                                            "INVALID"
+                                        }
+                                        Health::MetadataOnly => "METADATA ONLY",
+                                        Health::Unknown => {
+                                            report_invalid = true;
+                                            "NOT VERIFIED"
+                                        }
+                                    };
+                                    if let Err(error) = validation_session::append(
+                                        "Fab Vault Library",
+                                        &record.root,
+                                        &record.path,
+                                        "Authoritative manifest SHA-1",
+                                        outcome,
+                                        &record.detail,
+                                    ) {
+                                        self.cache_health.status =
+                                            format!("Manual log write failed: {error}");
+                                    }
+                                }
+                            }
                             for record in records {
                                 self.cache_health
                                     .report
                                     .records
                                     .insert(health::key(&record.path), record);
+                            }
+                            if report_invalid {
+                                self.cache_health.validation_log_open = true;
                             }
                             health::save(&self.cache_health.report);
                             self.rebuild_cache_health_links();
@@ -662,6 +983,17 @@ impl Workspace {
                             };
                         }
                         Err(error) => {
+                            if !self.cache_health.automatic {
+                                let _ = validation_session::append(
+                                    "Fab Vault Library",
+                                    Path::new(&roots.first().cloned().unwrap_or_default()),
+                                    Path::new("."),
+                                    "Authoritative manifest SHA-1",
+                                    "WORKER ERROR / INTERRUPTED",
+                                    &error,
+                                );
+                                self.cache_health.validation_log_open = true;
+                            }
                             if !error.contains("stopped") {
                                 if self.cache_health.invalidate_failed_check(&error) {
                                     health::save(&self.cache_health.report);
@@ -706,7 +1038,7 @@ impl Workspace {
             self.cache_health.status = if transfer_busy {
                 "Selected verification queued; waiting for the current operation to finish."
             } else {
-                "Selected verification queued; waiting for the current check to stop."
+                "Selected verification queued; waiting for the active verification to finish."
             }
             .into();
         }
@@ -737,6 +1069,12 @@ impl Workspace {
                 .clicked()
             {
                 self.start_cache_verification(Selection::All, false, ui.ctx());
+            }
+            if ui
+                .add(buttons::secondary_button("Validation history"))
+                .clicked()
+            {
+                self.cache_health.validation_log_open = true;
             }
             if self.cache_health.busy()
                 && ui
@@ -824,6 +1162,47 @@ impl Workspace {
         );
     }
     pub(super) fn cache_verification_dialog(&mut self, ctx: &Context) {
+        if self.cache_health.validation_log_open {
+            let mut open = true;
+            egui::Window::new("Manual Library Validation History")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(750.0)
+                .show(ctx, |ui| {
+                    let folder = validation_session::directory();
+                    ui.label(format!("Log location: {}", folder.display()));
+                    if let Ok(paths) = std::fs::read_dir(&folder) {
+                        let mut files: Vec<_> = paths
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().is_some_and(|e| e == "log"))
+                            .collect();
+                        files.sort();
+                        files.reverse();
+                        egui::ScrollArea::vertical()
+                            .max_height(560.0)
+                            .show(ui, |ui| {
+                                for path in files {
+                                    let label =
+                                        path.file_name().unwrap_or_default().to_string_lossy();
+                                    ui.collapsing(label, |ui| {
+                                        if let Ok(contents) = std::fs::read_to_string(&path) {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(contents).monospace(),
+                                                )
+                                                .selectable(true),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                    } else {
+                        ui.label("No manual validation logs have been created.");
+                    }
+                });
+            self.cache_health.validation_log_open = open;
+        }
         if !self.cache_health.details_open {
             return;
         }
@@ -855,7 +1234,12 @@ impl Workspace {
                 }
                 if let Some(selection) = &self.cache_health.pending_manual {
                     ui.add(
-                        Label::new(format!("Queued next: {}", selection_title(selection))).wrap(),
+                        Label::new(format!(
+                            "Queued next: {} ({} waiting)",
+                            selection_title(selection),
+                            1 + self.cache_health.queued_manual.len()
+                        ))
+                        .wrap(),
                     );
                 }
                 let p = &self.cache_health.progress;
@@ -899,7 +1283,31 @@ impl Workspace {
         );
         self.cache_health.details_open = open;
     }
+    /// True only when upstream's persisted cache-health records establish that
+    /// all applicable downloaded payloads passed their integrity checks.
+    pub(super) fn cached_item_fully_verified(&self, item: &engine_workspace::fab::Item) -> bool {
+        let records: Vec<_> = self
+            .cache_health
+            .for_item(item)
+            .into_iter()
+            .filter(|record| record.health != Health::MetadataOnly)
+            .collect();
+        !records.is_empty()
+            && records
+                .iter()
+                .all(|record| record.health == Health::Healthy)
+    }
     pub(super) fn cache_icon_tint(&self, item: &engine_workspace::fab::Item) -> [u8; 3] {
+        // The in-flight SHA-1 job overrides persisted health only for the
+        // selected asset. Other cards retain their own verified/unknown tint.
+        if self.cache_health.rx.is_some()
+            && matches!(
+                self.cache_health.selection.as_ref(),
+                Some(Selection::Item(active)) if active.key() == item.key()
+            )
+        {
+            return self.theme.accent;
+        }
         let records: Vec<_> = self
             .cache_health
             .for_item(item)
@@ -908,8 +1316,20 @@ impl Workspace {
             .collect();
         if records.iter().any(|r| r.health == Health::Redownload) {
             self.theme.warning
-        } else if !records.is_empty() && records.iter().all(|r| r.health == Health::Healthy) {
+        } else if !records.is_empty()
+            && records.iter().all(|r| r.health == Health::Healthy)
+            && records
+                .iter()
+                .all(|r| r.path.join("manifest").is_file() && r.path.join("data").is_dir())
+        {
             self.theme.success
+        } else if records
+            .iter()
+            .any(|r| r.path.join("manifest").is_file() && r.path.join("data").is_dir())
+        {
+            // Dark green means only that a previously identified package is
+            // still structurally present. It does not certify its file hashes.
+            [37, 117, 71]
         } else {
             self.theme.text
         }
@@ -1028,6 +1448,7 @@ impl Workspace {
                 .into(),
                 checked_at: epic::now(),
                 files: 25,
+                fingerprints: None,
             };
             self.cache_health
                 .report

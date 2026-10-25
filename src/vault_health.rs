@@ -58,6 +58,8 @@ pub struct Record {
     pub detail: String,
     pub checked_at: u64,
     pub files: u64,
+    #[serde(default)]
+    pub fingerprints: Option<crate::vault_fingerprint::Fingerprints>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Report {
@@ -207,6 +209,36 @@ pub fn write_download_index(
         &download_index(manifest, prefix, output)?,
     )
 }
+/// Record a newly published Vault download. Its payload files have already passed
+/// the downloader's SHA-1 checks against the trusted Fab manifest. No payload
+/// content is re-read here: only manifest and directory metadata are sampled.
+/// The expected-hash index is written to staging *before* publication by the caller.
+pub fn record_verified_vault_download(
+    root: &Path,
+    package: &Path,
+    title: &str,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let fingerprints = crate::vault_fingerprint::capture(package, true)?;
+    let checked_at = crate::epic::now();
+    let record = Record {
+        root: root.to_owned(),
+        path: package.to_owned(),
+        title: title.to_owned(),
+        identities: vec![manifest.app.clone()],
+        health: Health::Healthy,
+        detail: "All downloaded payload files passed Fab manifest SHA-1 checks; fingerprints were captured at publication.".into(),
+        checked_at,
+        files: manifest.files.len() as u64,
+        fingerprints: Some(fingerprints),
+    };
+    let mut report = load();
+    report.records.insert(key(package), record);
+    // Unlike the older best-effort UI save(), propagate failure so the caller
+    // can tell the user that the verification receipt could not be persisted.
+    crate::storage::write_json(&report_path(), &report)
+}
+
 fn legacy_plugin(path: &Path) -> Option<(String, String)> {
     let folder = path.file_name()?.to_str()?.strip_prefix("UE_")?;
     let (branch, fingerprint) = folder.rsplit_once('-')?;
@@ -429,6 +461,7 @@ fn verify_entry(
         detail: "No supported verification manifest or file hashes are available.".into(),
         checked_at: crate::epic::now(),
         files: 0,
+        fingerprints: None,
     };
     let mut paths = Vec::new();
     if let Err(error) = files(path, gate, &mut paths, 0) {
@@ -724,6 +757,9 @@ fn verify_entry(
     }
     gate.check()?;
     record.checked_at = crate::epic::now();
+    // Persist structural fingerprints beside the existing SHA-1 verification receipt.
+    // A fingerprint failure must not turn a valid SHA-1 verdict into a false failure.
+    record.fingerprints = crate::vault_fingerprint::capture(path, true).ok();
     Ok(Some(record))
 }
 
@@ -816,7 +852,16 @@ fn verify_roots_using(
             continue;
         }
         let mut paths = Vec::new();
-        entries(&root, &root, gate, &mut paths)?;
+        if let Selection::Entry(selected) = selection {
+            // A specific known package does not require enumerating every
+            // package in a large network Vault. Only accept paths inside root.
+            if selected.is_dir() && crate::discovery::inside(selected, &root) {
+                installer::no_links(selected)?;
+                paths.push(selected.clone());
+            }
+        } else {
+            entries(&root, &root, gate, &mut paths)?;
+        }
         for path in paths {
             if !visited.insert(key(&path)) {
                 continue;
@@ -862,6 +907,7 @@ fn verify_roots_using(
                     detail: format!("Not verified: {error}"),
                     checked_at: crate::epic::now(),
                     files: 0,
+                    fingerprints: None,
                 });
             }
         }

@@ -54,7 +54,7 @@ fn icon_button(ui: &mut Ui, theme: &Theme, label: &str, icon: Icon) -> bool {
         if hover {
             Stroke::NONE
         } else {
-            Stroke::new(1., color(theme.border))
+            Stroke::new(1_f32, color(theme.border))
         },
         StrokeKind::Inside,
     );
@@ -92,7 +92,7 @@ fn panel<R>(
 ) -> R {
     Frame::new()
         .fill(color(theme.card))
-        .stroke(Stroke::new(1., color(theme.border)))
+        .stroke(Stroke::new(1_f32, color(theme.border)))
         .corner_radius(6.)
         .inner_margin(20)
         .show(ui, |ui| {
@@ -294,7 +294,12 @@ impl Workspace {
                 ui.allocate_ui_with_layout(
                     vec2(main_width, 0.),
                     Layout::top_down(Align::Min),
-                    |ui| self.download_main(ui, t, active),
+                    |ui| {
+                        if !self.downloads.recent {
+                            self.vault_download_queue(ui, t);
+                        }
+                        self.download_main(ui, t, active);
+                    },
                 );
                 ui.vertical(|ui| {
                     ui.set_width(270.);
@@ -302,8 +307,11 @@ impl Workspace {
                 });
             });
         } else {
-            self.download_main(ui, t, active);
+            if !self.downloads.recent {
+                self.vault_download_queue(ui, t);
+            }
             self.download_side(ui, t, active);
+            self.download_main(ui, t, active);
         }
     }
     fn download_main(&mut self, ui: &mut Ui, t: &Theme, active: usize) {
@@ -341,7 +349,12 @@ impl Workspace {
                 {
                     self.transfer.operation.stop();
                 }
-            } else {
+            } else if self.transfer.busy()
+                || (self.library_transfer_status().is_some()
+                    && self.library.active_vault().is_none())
+                || self.plugin_work.mutating
+                || (active == 0 && !waiting && self.library.active_vault().is_none())
+            {
                 highlighted_panel(t).show(ui, |ui| {
                     ui.set_width((ui.available_width() - 2.).max(200.));
                     ui.horizontal(|ui| {
@@ -622,8 +635,9 @@ impl Workspace {
                 );
             });
             let query = self.downloads.search.to_lowercase();
+            let mut retry_request: Option<(usize, String, String)> = None;
             let mut count = 0;
-            for a in &self.downloads.history {
+            for (history_index, a) in self.downloads.history.iter().enumerate() {
                 if !format!("{} {} {}", a.item_label(), a.engine, a.message)
                     .to_lowercase()
                     .contains(&query)
@@ -700,7 +714,7 @@ impl Workspace {
                         ui.painter().rect_filled(rect, 5., color(SIDEBAR_HIGHLIGHT));
                     }
                     let center = rect.center();
-                    let stroke = Stroke::new(1.5, color(fg));
+                    let stroke = Stroke::new(1.5_f32, color(fg));
                     ui.painter().circle_stroke(center, 9., stroke);
                     ui.painter()
                         .line_segment([center - vec2(0., 5.), center + vec2(0., 1.)], stroke);
@@ -709,8 +723,46 @@ impl Workspace {
                     Popup::menu(&response).frame(menu_frame(t)).show(|ui| {
                         ui.label(&a.message);
                     });
+                    if !a.success && a.item.starts_with("Vault Cache download: ") {
+                        let retry = ui
+                            .button("Retry")
+                            .on_hover_text("Re-add this failed asset to the Vault download queue");
+                        if retry.clicked() {
+                            if let Some(title) = a.item.strip_prefix("Vault Cache download: ") {
+                                retry_request =
+                                    Some((history_index, title.to_owned(), a.engine.clone()));
+                            }
+                        }
+                    }
                 });
                 ui.separator();
+            }
+            if let Some((history_index, title, destination)) = retry_request {
+                if self.demo || self.session.is_none() {
+                    self.notify("Sign in to retry Vault downloads.");
+                } else {
+                    match self.library.retry_failed_vault_download(
+                        &title,
+                        &destination,
+                        self.prefs.chunk_cache_root(),
+                    ) {
+                        Ok(()) => {
+                            // A successful retry supersedes this failed history record.
+                            // Leave all other entries (including prior successes) untouched.
+                            self.downloads.history.remove(history_index);
+                            if let Err(e) = storage::write_json(
+                                &storage::data_dir().join("download-history.json"),
+                                &self.downloads.history,
+                            ) {
+                                self.notify(format!(
+                                    "Retry queued, but could not save download history: {e}"
+                                ));
+                            }
+                            self.notify(format!("Re-queued Vault download: {title}"));
+                        }
+                        Err(e) => self.notify(format!("Could not retry Vault download: {e}")),
+                    }
+                }
             }
             if count == 0 {
                 ui.label(if !query.is_empty() {
@@ -723,6 +775,246 @@ impl Workspace {
             }
         });
     }
+
+    // Painter-drawn control glyphs: do not depend on Unicode font coverage.
+    fn vault_transfer_control(ui: &mut Ui, pause: bool) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(32.0, 28.0), Sense::click());
+        let tint = if pause {
+            Color32::from_rgb(240, 188, 38)
+        } else {
+            Color32::RED
+        };
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, Color32::from_white_alpha(18));
+        }
+        let c = rect.center();
+        let stroke = Stroke::new(2.3_f32, tint);
+        if pause {
+            for x in [-4.0_f32, 4.0_f32] {
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(c.x + x, c.y - 7.0),
+                        egui::pos2(c.x + x, c.y + 7.0),
+                    ],
+                    stroke,
+                );
+            }
+        } else {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - 6.0, c.y - 6.0),
+                    egui::pos2(c.x + 6.0, c.y + 6.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x + 6.0, c.y - 6.0),
+                    egui::pos2(c.x - 6.0, c.y + 6.0),
+                ],
+                stroke,
+            );
+        }
+        response
+    }
+
+    // Pending Vault downloads use the Library artwork cache and the actual dispatch deque.
+    // Reordering does not interrupt the active transfer.
+    fn vault_download_queue(&mut self, ui: &mut Ui, t: &Theme) {
+        let jobs = self.library.vault_jobs();
+        let active = self.library_transfer_status().is_some();
+        if jobs.is_empty() && self.library.active_vault().is_none() {
+            return;
+        }
+        panel(ui, t, "Vault downloads", None, |ui| {
+            if let Some((item, branch, root, progress)) = self.library.active_vault() {
+                let key = format!("fab:{}", item.key());
+                if let Some(url) = item.thumbnail() {
+                    self.queue_library_thumbnail(key.clone(), url, ui.ctx());
+                }
+                let mut pause = false;
+                let mut cancel = false;
+                Frame::new().fill(color(t.card)).corner_radius(6.).inner_margin(8.).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(texture) = self.textures.get(&key) {
+                            ui.add(egui::Image::new(texture).fit_to_exact_size(vec2(92., 58.)));
+                        } else { ui.allocate_space(vec2(92., 58.)); }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&item.title).strong().color(color(t.text)));
+                            ui.label(RichText::new(format!("Downloading · {branch}")).small().color(color(t.muted)));
+                            ui.label(RichText::new(&root).small().color(color(t.muted)));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if Self::vault_transfer_control(ui, false).on_hover_text("Cancel active download").clicked() { cancel = true; }
+                            if Self::vault_transfer_control(ui, true).on_hover_text("Pause active download (staging and completed chunks retained)").clicked() { pause = true; }
+                        });
+                    });
+                    if let Some((done, total)) = progress {
+                        let remaining = total.saturating_sub(done);
+                        let mib = |n: u64| n as f64 / 1048576.0;
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).show_percentage());
+                        ui.label(format!("Downloaded: {:.2} MiB  ·  Remaining: {:.2} MiB  ·  Total: {:.2} MiB", mib(done), mib(remaining), mib(total)));
+                    } else { ui.label(RichText::new("Preparing package / reading manifest...").small().color(color(t.muted))); }
+                });
+                if pause {
+                    self.library.pause_active_vault();
+                }
+                if cancel {
+                    self.library.cancel_active_vault();
+                }
+                ui.add_space(8.);
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{} downloading · {} waiting",
+                    active as usize,
+                    jobs.len()
+                ))
+                .strong()
+                .color(color(t.text)),
+            );
+            ui.label(RichText::new("Drag a waiting asset thumbnail to reorder, or use the arrows. The active transfer is not draggable.")
+                .small().color(color(t.muted)));
+            ui.add_space(4.);
+            let drag_id = Id::new("vault-download-drag-source");
+            let dragged = ui.ctx().data(|d| d.get_temp::<usize>(drag_id));
+            let mut rows = Vec::new();
+            let mut dropped = false;
+            let mut remove = None;
+            let mut resume = None;
+            let mut move_to = None;
+            for (index, (item, branch, root, paused)) in jobs.iter().enumerate() {
+                let key = format!("fab:{}", item.key());
+                if let Some(url) = item.thumbnail() {
+                    self.queue_library_thumbnail(key.clone(), url, ui.ctx());
+                }
+                let inner = Frame::new()
+                    .fill(color(t.card))
+                    .corner_radius(6.)
+                    .inner_margin(8.)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let image = if let Some(texture) = self.textures.get(&key) {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(vec2(92., 58.))
+                                        .sense(Sense::drag()),
+                                )
+                            } else {
+                                let (rect, response) =
+                                    ui.allocate_exact_size(vec2(92., 58.), Sense::drag());
+                                ui.painter().rect_filled(rect, 5., color(t.border));
+                                response
+                            };
+                            if image.drag_started() {
+                                ui.ctx().data_mut(|d| d.insert_temp(drag_id, index));
+                            }
+                            if image.drag_stopped() {
+                                dropped = true;
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&item.title).strong().color(color(t.text)));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} #{} · {}",
+                                        if *paused { "Paused" } else { "Queued" },
+                                        index + 1,
+                                        branch
+                                    ))
+                                    .small()
+                                    .color(color(t.warning)),
+                                );
+                                ui.add(
+                                    Label::new(RichText::new(root).small().color(color(t.muted)))
+                                        .truncate(),
+                                )
+                                .on_hover_text(root);
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        *paused || self.library.vault_queue_held,
+                                        egui::Button::new(RichText::new("▶").color(Color32::GREEN)),
+                                    )
+                                    .on_hover_text("Resume queued download")
+                                    .clicked()
+                                {
+                                    resume = Some(index);
+                                }
+                                if Self::vault_transfer_control(ui, false)
+                                    .on_hover_text("Cancel queued download and clean staging")
+                                    .clicked()
+                                {
+                                    remove = Some(index);
+                                }
+                                if ui
+                                    .add_enabled(index + 1 < jobs.len(), egui::Button::new("↓"))
+                                    .on_hover_text("Move down")
+                                    .clicked()
+                                {
+                                    move_to = Some((index, index + 1));
+                                }
+                                if ui
+                                    .add_enabled(index > 0, egui::Button::new("↑"))
+                                    .on_hover_text("Move up")
+                                    .clicked()
+                                {
+                                    move_to = Some((index, index - 1));
+                                }
+                            });
+                        });
+                    });
+                rows.push(inner.response.rect);
+                if dragged.is_some() && ui.ctx().input(|i| i.pointer.primary_down()) {
+                    if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                        if pointer.y >= inner.response.rect.top()
+                            && pointer.y <= inner.response.rect.bottom()
+                        {
+                            let y = if pointer.y < inner.response.rect.center().y {
+                                inner.response.rect.top()
+                            } else {
+                                inner.response.rect.bottom()
+                            };
+                            ui.painter().hline(
+                                inner.response.rect.x_range(),
+                                y,
+                                Stroke::new(3_f32, Color32::from_rgb(55, 150, 250)),
+                            );
+                        }
+                    }
+                }
+                ui.add_space(4.);
+            }
+            if dropped {
+                let pointer = ui.ctx().pointer_hover_pos();
+                let source = ui.ctx().data(|d| d.get_temp::<usize>(drag_id));
+                ui.ctx().data_mut(|d| d.remove::<usize>(drag_id));
+                if let (Some(source), Some(pointer)) = (source, pointer) {
+                    let over_queue = rows.iter().any(|row| row.expand(18.).contains(pointer));
+                    if over_queue {
+                        if let Some((destination, _)) = rows.iter().enumerate().min_by(|a, b| {
+                            let da = (a.1.center().y - pointer.y).abs();
+                            let db = (b.1.center().y - pointer.y).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        }) {
+                            move_to = Some((source, destination));
+                        }
+                    }
+                }
+            }
+            if let Some((from, to)) = move_to {
+                self.library.move_vault_waiting(from, to);
+            }
+            if let Some(index) = resume {
+                self.library.resume_vault_waiting(index);
+            }
+            if let Some(index) = remove {
+                self.library.remove_vault_waiting(index);
+            }
+        });
+    }
+
     fn download_side(&mut self, ui: &mut Ui, t: &Theme, active: usize) {
         panel(ui, t, "Download queue", None, |ui| {
             ui.label(
@@ -802,7 +1094,21 @@ impl Workspace {
             }
         });
         panel(ui, t, "Storage", None, |ui| {
-            let root = Path::new(&self.prefs.install_root);
+            let destination = self
+                .library
+                .active_vault()
+                .map(|(_, _, root, _)| root)
+                .or_else(|| {
+                    if self.transfer.busy() && !self.transfer.parent.is_empty() {
+                        Some(self.transfer.parent.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| self.prefs.install_root.clone());
+            let root = Path::new(&destination);
+            // Never fall back to another drive for missing/unavailable network paths.
+            // For a local path whose subfolder does not yet exist, use its existing parent.
             let existing = root.ancestors().find(|p| p.exists()).unwrap_or(root);
             if let (Ok(free), Ok(total)) =
                 (fs2::available_space(existing), fs2::total_space(existing))
@@ -821,11 +1127,7 @@ impl Workspace {
                         0.
                     }));
                 });
-                ui.label(
-                    RichText::new(&self.prefs.install_root)
-                        .size(13.)
-                        .color(color(t.muted)),
-                );
+                ui.label(RichText::new(&destination).size(13.).color(color(t.muted)));
             } else {
                 ui.label("Storage information unavailable");
             }
@@ -843,6 +1145,9 @@ impl Workspace {
         let before = self.prefs.downloads.clone();
         let old_root = self.prefs.install_root.clone();
         let old_cache = self.prefs.fab_cache.clone();
+        let old_default_vault = self.prefs.default_vault_cache.clone();
+        let old_chunk_mode = self.prefs.chunk_cache_uses_vault_cache;
+        let old_staging_root = self.prefs.local_install_staging_root.clone();
         let old_paths = self.prefs.vault_cache_paths.clone();
         let old_ask = self.prefs.ask_vault_cache;
         self.install_preferences(ui, t);
@@ -865,8 +1170,8 @@ impl Workspace {
             "Fab asset cache",
             Some("Reuse verified downloads for assets and plugins."),
             |ui| {
-                ui.label("Default cache directory");
-                dialog::folder(ui, &mut self.prefs.fab_cache);
+                ui.label("Default Vault Cache directory");
+                dialog::folder(ui, &mut self.prefs.default_vault_cache);
                 let roots = self.prefs.vault_cache_roots();
                 let mut make_default = None;
                 let mut remove_path = None;
@@ -942,15 +1247,46 @@ impl Workspace {
                         }
                     }
                 }
+                ui.separator();
+                ui.checkbox(
+                    &mut self.prefs.chunk_cache_uses_vault_cache,
+                    "Chunk Cache Uses Vault Cache",
+                );
+                if !self.prefs.chunk_cache_uses_vault_cache {
+                    ui.label("Separate Fab Download Chunk Cache location");
+                    dialog::folder(ui, &mut self.prefs.fab_cache);
+                } else {
+                    ui.label("Reusable chunks use the default Vault Cache location.");
+                }
                 ui.add(buttons::checkbox(
                     &mut self.prefs.ask_vault_cache,
                     "Ask which cache to use for Download only",
                     t,
                 ));
+                ui.separator();
+                ui.label("Local installation staging root (network Vault sources only)");
+                dialog::folder(ui, &mut self.prefs.local_install_staging_root);
+                if let Err(problem) = engine_workspace::install_staging::ensure_local_path(
+                    Path::new(&self.prefs.local_install_staging_root),
+                ) {
+                    ui.label(
+                        RichText::new(format!("Staging path warning: {problem}"))
+                            .color(color(t.warning)),
+                    );
+                }
+                ui.label("Used only for installing assets, projects and plugins from a network Vault. Must be on a writable local volume; temporary operation folders are removed after safe completion.");
+                if ui
+                    .add(buttons::secondary_button("Reset staging folder"))
+                    .clicked()
+                {
+                    self.prefs.local_install_staging_root =
+                        storage::Preferences::default().local_install_staging_root;
+                }
                 ui.label("With multiple locations, choose where each plugin download is saved. Verified download chunks can be reused from every listed cache. Removing a location does not delete its files.");
                 ui.horizontal(|ui| {
                     if icon_button(ui, t, "Reset", Icon::Reset) {
-                        self.prefs.fab_cache = storage::Preferences::default().fab_cache;
+                        self.prefs.default_vault_cache =
+                            storage::Preferences::default().default_vault_cache;
                     }
                     ui.label(
                         RichText::new(
@@ -967,12 +1303,18 @@ impl Workspace {
             let defaults = storage::Preferences::default();
             self.prefs.install_root = defaults.install_root;
             self.prefs.fab_cache = defaults.fab_cache;
+            self.prefs.default_vault_cache = defaults.default_vault_cache;
+            self.prefs.chunk_cache_uses_vault_cache = defaults.chunk_cache_uses_vault_cache;
             self.prefs.vault_cache_paths = defaults.vault_cache_paths;
             self.prefs.ask_vault_cache = defaults.ask_vault_cache;
+            self.prefs.local_install_staging_root = defaults.local_install_staging_root;
         }
         if before != self.prefs.downloads
             || old_root != self.prefs.install_root
             || old_cache != self.prefs.fab_cache
+            || old_default_vault != self.prefs.default_vault_cache
+            || old_chunk_mode != self.prefs.chunk_cache_uses_vault_cache
+            || old_staging_root != self.prefs.local_install_staging_root
             || old_paths != self.prefs.vault_cache_paths
             || old_ask != self.prefs.ask_vault_cache
         {

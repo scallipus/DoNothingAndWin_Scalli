@@ -464,7 +464,7 @@ impl Workspace {
                         let icon =
                             Rect::from_center_size(close_button.rect.center(), Vec2::splat(14.));
                         let stroke =
-                            Stroke::new(2., ui.style().interact(&close_button).fg_stroke.color);
+                            Stroke::new(2_f32, ui.style().interact(&close_button).fg_stroke.color);
                         ui.painter()
                             .line_segment([icon.left_top(), icon.right_bottom()], stroke);
                         ui.painter()
@@ -669,7 +669,7 @@ impl Workspace {
                                 ui.painter().rect_stroke(
                                     row,
                                     4.,
-                                    Stroke::new(1., color(t.warning).gamma_multiply(0.22)),
+                                    Stroke::new(1_f32, color(t.warning).gamma_multiply(0.22)),
                                     StrokeKind::Inside,
                                 );
                                 ui.painter().rect_filled(
@@ -840,7 +840,7 @@ impl Workspace {
                                     ui.put(
                                         remove_rect,
                                         plugin_button("Remove")
-                                            .stroke(Stroke::new(1., color(t.danger))),
+                                            .stroke(Stroke::new(1_f32, color(t.danger))),
                                     )
                                 })
                                 .inner
@@ -858,7 +858,7 @@ impl Workspace {
                                     row.right_bottom() - vec2(0., 1.),
                                 ],
                                 Stroke::new(
-                                    1.,
+                                    1_f32,
                                     color(if t.dark {
                                         [76, 85, 94]
                                     } else {

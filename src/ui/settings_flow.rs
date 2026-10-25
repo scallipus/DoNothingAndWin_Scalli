@@ -7,6 +7,122 @@ pub(super) struct EngineSpace {
     rx: Option<Receiver<(u64, bool)>>,
     checked: Option<Instant>,
 }
+
+#[derive(Default)]
+pub(super) struct VaultDiscovery {
+    pub path: String,
+    pub rx: Option<Receiver<Result<engine_workspace::vault_scan::VaultScan, String>>>,
+}
+#[derive(Default)]
+pub(super) struct CacheSpace {
+    path: String,
+    last_checked: Option<Instant>,
+    rx: Option<Receiver<(Option<u64>, Option<u64>)>>,
+    result: Option<(Option<u64>, Option<u64>)>,
+}
+fn cache_folder_bytes(root: &Path, exclude_workspace: bool) -> Option<u64> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let name = entry.file_name();
+            if exclude_workspace && dir == root && name == "EngineWorkspace" {
+                continue;
+            }
+            let ty = entry.file_type().ok()?;
+            if ty.is_symlink() {
+                continue;
+            }
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else if ty.is_file() {
+                total = total.saturating_add(entry.metadata().ok()?.len());
+            }
+        }
+    }
+    Some(total)
+}
+fn cache_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes as f64;
+    let mut index = 0;
+    while value >= 1024. && index + 1 < UNITS.len() {
+        value /= 1024.;
+        index += 1;
+    }
+    format!("{value:.2} {}", UNITS[index])
+}
+impl CacheSpace {
+    fn show(&mut self, ui: &mut Ui, path: &str, chunk_only: bool) {
+        if self.rx.is_none()
+            && (self.path != path
+                || self
+                    .last_checked
+                    .is_none_or(|t| t.elapsed() > Duration::from_secs(300)))
+        {
+            self.path = path.to_string();
+            self.result = None;
+            self.last_checked = Some(Instant::now());
+            let path = std::path::PathBuf::from(path);
+            let (tx, rx) = mpsc::channel();
+            self.rx = Some(rx);
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                // Report volume free space immediately, before the potentially
+                // lengthy recursive cache-size scan (especially network shares).
+                let free = fs2::available_space(&path).ok();
+                let _ = tx.send((None, free));
+                ctx.request_repaint();
+                let scanned = if chunk_only {
+                    cache_folder_bytes(&path.join("EngineWorkspace/Chunks"), false)
+                } else {
+                    cache_folder_bytes(&path, true)
+                };
+                let _ = tx.send((scanned, free));
+                ctx.request_repaint();
+            });
+        }
+        if let Some(result) = self.rx.as_ref().map(|rx| rx.try_recv()) {
+            match result {
+                Ok(result) => {
+                    let has_scanned = result.0.is_some();
+                    self.result = Some(result);
+                    if has_scanned {
+                        self.rx = None;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            let used = self
+                .result
+                .as_ref()
+                .and_then(|x| x.0)
+                .map(cache_size)
+                .unwrap_or_else(|| {
+                    if self.rx.is_some() {
+                        "Calculating…".into()
+                    } else {
+                        "Unavailable".into()
+                    }
+                });
+            let free = self
+                .result
+                .as_ref()
+                .and_then(|x| x.1)
+                .map(cache_size)
+                .unwrap_or_else(|| "Unavailable".into());
+            ui.label(format!("Cache Used: {used}"));
+            ui.label(format!("Storage Free: {free}"));
+        });
+    }
+}
+
 impl Workspace {
     pub(super) fn add_project_root(&mut self, path: std::path::PathBuf, ctx: &Context) {
         self.add_project_roots(vec![path], ctx);
@@ -90,7 +206,7 @@ impl Workspace {
         let r = c.rect([510., 130., 180., 28.]);
         let p = ui.painter();
         let tint = color(self.theme.muted);
-        let s = Stroke::new(1.5, tint);
+        let s = Stroke::new(1.5_f32, tint);
         let o = r.min + vec2(2., 5.);
         p.add(Shape::line(
             vec![
@@ -175,7 +291,83 @@ impl Workspace {
                     if self.scan.receiver.is_some(){ui.add(loading::spinner(&theme));ui.label("Scanning project folders…");}
                 });
                 });
+                settings_section(ui, &theme, |ui| {
+                    ui.heading("Library appearance");
+                    ui.label("Asset card thumbnail size");
+                    let previous = self.prefs.library_thumbnail_size;
+                    egui::ComboBox::from_id_salt("library-thumbnail-size")
+                        .selected_text(match previous {
+                            64 => "64 × 64 (Small)",
+                            128 => "128 × 128 (Compact)",
+                            192 => "192 × 192 (Large)",
+                            256 => "256 × 256 (Extra large)",
+                            _ => "Original (recommended)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.prefs.library_thumbnail_size, 0, "Original (recommended)");
+                            ui.selectable_value(&mut self.prefs.library_thumbnail_size, 64, "64 × 64 (Small)");
+                            ui.selectable_value(&mut self.prefs.library_thumbnail_size, 128, "128 × 128 (Compact)");
+                            ui.selectable_value(&mut self.prefs.library_thumbnail_size, 192, "192 × 192 (Large)");
+                            ui.selectable_value(&mut self.prefs.library_thumbnail_size, 256, "256 × 256 (Extra large)");
+                        });
+                    if self.prefs.library_thumbnail_size != previous { self.persist(); }
+                    ui.label("Changing the size reflows Library cards. Alt + mouse wheel is no longer used.");
+                });
                 settings_section(ui,&theme,|ui|{
+
+                ui.horizontal(|ui| {
+                    cache_location_icon(ui, true);
+                    ui.heading("Cache Location Settings");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Vault locations are managed in Download Settings.");
+                    if ui.add(buttons::secondary_button("Manage Vault locations")).clicked() {
+                        self.page = Page::Downloads;
+                        self.downloads.settings = true;
+                    }
+                });
+                let previous = self.prefs.chunk_cache_uses_vault_cache;
+                ui.horizontal(|ui| {
+                    cache_location_icon(ui, false);
+                    ui.checkbox(&mut self.prefs.chunk_cache_uses_vault_cache, "Chunk Cache Uses Vault Cache");
+                });
+                if self.prefs.chunk_cache_uses_vault_cache != previous { self.persist(); }
+                ui.label("When enabled, chunks use the selected default Vault location. Disable to select a separate chunk cache (such as an SSD).");
+                if !self.prefs.chunk_cache_uses_vault_cache {
+                    ui.label("Fab Download Chunk Cache location");
+                    let old = self.prefs.fab_cache.clone();
+                    dialog::folder(ui, &mut self.prefs.fab_cache);
+                    if self.prefs.fab_cache != old { self.persist(); }
+                }
+                self.fab_cache_space.show(ui, self.prefs.chunk_cache_root(), true);
+                ui.separator();
+                ui.label("Default Epic Vault Cache");
+                ui.label(&self.prefs.default_vault_cache);
+                self.vault_cache_space.show(ui, &self.prefs.default_vault_cache, false);
+                ui.label("Vault inventory and verification across all configured locations are available on the Vault Cache page.");
+                });
+                settings_section(ui,&theme,|ui|{
+                    ui.heading("Custom Asset Cache");
+                    ui.label("ZIP archive locations. Original archives remain unchanged; catalogue verification is performed separately.");
+                    let mut remove = None;
+                    for (index, path) in self.prefs.custom_asset_caches.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(path);
+                            if ui.small_button("Remove").clicked() { remove = Some(index); }
+                        });
+                    }
+                    if let Some(index) = remove { self.prefs.custom_asset_caches.remove(index); self.persist(); }
+                    if ui.add(buttons::secondary_button("Add archive folder")).clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().set_title("Select custom asset archive folder").pick_folder() {
+                            let path = dialog::display_path(&folder.to_string_lossy());
+                            if !self.prefs.custom_asset_caches.iter().any(|p| p == &path) {
+                                self.prefs.custom_asset_caches.push(path); self.persist();
+                            }
+                        }
+                    }
+                });
+                settings_section(ui,&theme,|ui|{
+
                 ui.heading("Appearance");
                 if downloads::toggle(ui, &theme, &mut self.prefs.show_vault_cache_button, "Show Vault Cache in sidebar", "View the cache folder configured in Download settings, including sizes and cached-file removal.") { self.persist(); }
                 if downloads::toggle(ui, &theme, &mut self.prefs.show_free_offers_button, "Show Limited-Time Free in sidebar", "Show the Fab limited-time free offers button in the sidebar.") { self.persist(); }
@@ -247,7 +439,7 @@ impl Workspace {
 pub(super) fn settings_section(ui: &mut Ui, theme: &Theme, body: impl FnOnce(&mut Ui)) -> Response {
     Frame::new()
         .fill(color(theme.card))
-        .stroke(Stroke::new(1., color(theme.border)))
+        .stroke(Stroke::new(1_f32, color(theme.border)))
         .corner_radius(6.)
         .inner_margin(20)
         .show(ui, |ui| {
@@ -255,4 +447,35 @@ pub(super) fn settings_section(ui: &mut Ui, theme: &Theme, body: impl FnOnce(&mu
             body(ui);
         })
         .response
+}
+
+/// Painter-drawn cache location symbols, independent of icon fonts.
+fn cache_location_icon(ui: &mut egui::Ui, vault: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    let c = if vault {
+        egui::Color32::from_rgb(70, 165, 235)
+    } else {
+        egui::Color32::from_rgb(55, 190, 145)
+    };
+    let p = ui.painter();
+    let r = rect.shrink(3.0);
+    p.rect_stroke(
+        r,
+        3.0,
+        egui::Stroke::new(1.8_f32, c),
+        egui::StrokeKind::Inside,
+    );
+    if vault {
+        p.line_segment(
+            [
+                egui::pos2(r.left() + 3.0, r.center().y),
+                egui::pos2(r.right() - 3.0, r.center().y),
+            ],
+            egui::Stroke::new(1.8_f32, c),
+        );
+    } else {
+        for dx in [-3.0_f32, 3.0] {
+            p.circle_filled(r.center() + egui::vec2(dx, 0.0), 1.6, c);
+        }
+    }
 }

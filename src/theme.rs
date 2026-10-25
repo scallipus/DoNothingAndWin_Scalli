@@ -73,7 +73,7 @@ impl Theme {
         v.selection.stroke.color = color(self.on_accent);
         v.widgets.inactive.bg_fill = color(self.card);
         v.widgets.inactive.weak_bg_fill = color(self.card);
-        v.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1., color(self.border));
+        v.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1_f32, color(self.border));
         v.widgets.hovered.weak_bg_fill = color([234, 189, 93]);
         v.widgets.active.weak_bg_fill = color([234, 189, 93]);
         for widget in [

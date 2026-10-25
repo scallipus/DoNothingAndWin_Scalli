@@ -4,7 +4,15 @@ use std::path::PathBuf;
 
 enum Event {
     Progress(String),
-    Finished(Result<Inventory, String>),
+    Finished(
+        Result<
+            (
+                Inventory,
+                Vec<(Entry, engine_workspace::vault_fingerprint::Fingerprints)>,
+            ),
+            String,
+        >,
+    ),
 }
 #[derive(Default)]
 pub(super) struct Vault {
@@ -47,7 +55,7 @@ pub(super) fn dots(ui: &mut Ui, theme: &Theme) -> Response {
     ui.painter().rect_stroke(
         rect,
         4.,
-        Stroke::new(1., color(theme.border)),
+        Stroke::new(1_f32, color(theme.border)),
         StrokeKind::Inside,
     );
     downloads::draw_icon(
@@ -126,6 +134,20 @@ impl Workspace {
                     last = Instant::now();
                 }
             });
+            // Fast, non-recursive structural validation after discovery, on this same
+            // background worker. No full-tree traversal or payload hashing here.
+            let result = result.map(|inventory| {
+                let quick = inventory
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        engine_workspace::vault_fingerprint::capture(&entry.path, false)
+                            .ok()
+                            .map(|fingerprint| (entry.clone(), fingerprint))
+                    })
+                    .collect();
+                (inventory, quick)
+            });
             let _ = tx.send(Event::Finished(result));
             ctx.request_repaint();
         });
@@ -153,7 +175,52 @@ impl Workspace {
                     finished = true;
                     if self.vault.roots == self.prefs.vault_cache_roots() {
                         match result {
-                            Ok(inv) => {
+                            Ok((inv, fingerprints)) => {
+                                let mut changed = false;
+                                for (entry, fingerprint) in fingerprints {
+                                    let key = engine_workspace::vault_health::key(&entry.path);
+                                    if let Some(record) =
+                                        self.cache_health.report.records.get_mut(&key)
+                                    {
+                                        if record.fingerprints.as_ref().is_some_and(|old| {
+                                            old.schema == fingerprint.schema
+                                                && old.quick != fingerprint.quick
+                                        }) {
+                                            // A changed structure invalidates the earlier SHA-1 verdict.
+                                            record.health =
+                                                engine_workspace::vault_health::Health::Unknown;
+                                            record.detail = "Vault package structure changed since its previous verification.".into();
+                                        }
+                                        let full_tree = record
+                                            .fingerprints
+                                            .as_ref()
+                                            .filter(|old| old.quick == fingerprint.quick)
+                                            .and_then(|old| old.full_tree.clone());
+                                        record.fingerprints = Some(
+                                            engine_workspace::vault_fingerprint::Fingerprints {
+                                                full_tree,
+                                                ..fingerprint
+                                            },
+                                        );
+                                        if !entry.identities.is_empty() {
+                                            record.identities = entry.identities;
+                                        }
+                                    } else {
+                                        self.cache_health.report.records.insert(key,
+                                            engine_workspace::vault_health::Record {
+                                                root: entry.root, path: entry.path, title: entry.title,
+                                                identities: entry.identities,
+                                                health: engine_workspace::vault_health::Health::Unknown,
+                                                detail: "Cached package structure detected; full SHA-1 verification not yet performed.".into(),
+                                                checked_at: 0, files: 0, fingerprints: Some(fingerprint),
+                                            });
+                                    }
+                                    changed = true;
+                                }
+                                if changed {
+                                    engine_workspace::vault_health::save(&self.cache_health.report);
+                                    self.rebuild_cache_health_links();
+                                }
                                 self.vault.inventory = Some(inv);
                                 self.vault.error = None;
                             }
@@ -313,7 +380,7 @@ impl Workspace {
             ui.add(
                 Label::new(
                     RichText::new(if cache_roots.len() == 1 {
-                        self.prefs.fab_cache.clone()
+                        self.prefs.default_vault_cache.clone()
                     } else {
                         format!(
                             "{} cache locations • Total across all locations",
@@ -520,7 +587,7 @@ impl Workspace {
                 );
                 Frame::new()
                     .fill(color(theme.card))
-                    .stroke(Stroke::new(1., color(theme.border)))
+                    .stroke(Stroke::new(1_f32, color(theme.border)))
                     .corner_radius(6.)
                     .show(ui, |ui| {
                         ui.set_width(width - 2.);
